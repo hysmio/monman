@@ -33,6 +33,9 @@ Windows, so Windows deactivates the display path.
 - Report global-hotkey registration failures in the GUI instead of silently ignoring
   reserved or conflicting shortcuts.
 - Capture the current topology before every apply, automatically attempt rollback on a failed two-stage apply, and offer **Undo last apply** after success.
+- Persist the last topology observed after a healthy startup or successful apply. If
+  Windows later starts with zero/one active path whose target is unavailable, restore
+  that topology only after every enabled fallback monitor is confirmed present and routable.
 - Keep a backup of the last parseable `layouts.json` and recover from it if the primary file becomes unreadable/corrupt.
 - Refuse to apply an all-off layout.
 - Refuse to silently substitute a different target when a required saved monitor is
@@ -109,6 +112,12 @@ Before applying a layout, MonMan captures the currently active topology in memor
 two-stage CCD apply fails after changing active paths, it attempts to restore that snapshot.
 After a successful apply, **Undo last apply** restores the snapshot manually.
 
+MonMan also stores a separate last-known-working topology in `layouts.json`. At startup it
+waits briefly for display enumeration to settle. Automatic recovery is attempted only when
+there are no available active targets in a zero/single-path topology, and only when Windows
+currently exposes valid routes to every monitor that the fallback would enable. A missing
+fallback monitor causes recovery to be skipped rather than substituted.
+
 ## Important distinction: Windows-disable vs hardware power-off
 
 "Off" in MonMan means the Windows display path is deactivated. The monitor is no longer
@@ -143,6 +152,9 @@ woken after MonMan starts.
   Windows can reject CCD changes from unsupported/remote contexts.
 - A layout intentionally fails if a required target is disconnected instead of choosing
   a different monitor with a similar friendly name.
+- Startup recovery depends on Windows reporting the broken active target as unavailable;
+  displays or adapters that keep reporting availability while physically powered off
+  cannot be distinguished reliably through CCD alone.
 - DisplayConfig path scaling is captured/restored, but its GUI editing is not exposed yet.
 - Windows per-monitor DPI percentage is not the same field as DisplayConfig path scaling
   and is not currently edited by MonMan.

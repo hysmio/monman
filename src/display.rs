@@ -12,6 +12,16 @@ pub fn apply_layout(_layout: &MonitorLayout) -> Result<()> {
     bail!("MonMan display control is only available on Windows")
 }
 
+#[cfg(not(windows))]
+pub fn startup_topology_needs_recovery() -> Result<bool> {
+    bail!("MonMan display control is only available on Windows")
+}
+
+#[cfg(not(windows))]
+pub fn ensure_layout_available(_layout: &MonitorLayout) -> Result<()> {
+    bail!("MonMan display control is only available on Windows")
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;
@@ -212,6 +222,41 @@ mod win {
             );
         }
 
+        Ok(())
+    }
+
+    pub(super) fn startup_topology_needs_recovery_impl() -> Result<bool> {
+        // Display availability can briefly lag behind process startup. Only recover
+        // after the same unhealthy state survives a short retry window.
+        for attempt in 0..4 {
+            let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+            let availability: Vec<bool> = active
+                .paths
+                .iter()
+                .map(|path| path.targetInfo.targetAvailable.as_bool())
+                .collect();
+            let needs_recovery = topology_state_needs_recovery(&availability);
+            if !needs_recovery {
+                return Ok(false);
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
+        Ok(true)
+    }
+
+    fn topology_state_needs_recovery(active_target_availability: &[bool]) -> bool {
+        active_target_availability.len() <= 1
+            && active_target_availability
+                .iter()
+                .all(|available| !available)
+    }
+
+    pub(super) fn ensure_layout_available_impl(layout: &MonitorLayout) -> Result<()> {
+        validate_layout(layout)?;
+        let all = query(QDC_ALL_PATHS)?;
+        select_paths(layout, &all.paths)?;
         Ok(())
     }
 
@@ -705,6 +750,15 @@ mod win {
             let only_source = (0, 1, 0);
             assert!(assign_sources(&[vec![only_source], vec![only_source]]).is_none());
         }
+
+        #[test]
+        fn startup_recovery_only_triggers_for_zero_or_one_unavailable_target() {
+            assert!(topology_state_needs_recovery(&[]));
+            assert!(topology_state_needs_recovery(&[false]));
+            assert!(!topology_state_needs_recovery(&[true]));
+            assert!(!topology_state_needs_recovery(&[false, false]));
+            assert!(!topology_state_needs_recovery(&[false, true]));
+        }
     }
 }
 
@@ -716,4 +770,14 @@ pub fn capture_layout(name: impl Into<String>) -> Result<MonitorLayout> {
 #[cfg(windows)]
 pub fn apply_layout(layout: &MonitorLayout) -> Result<()> {
     win::apply_layout_impl(layout)
+}
+
+#[cfg(windows)]
+pub fn startup_topology_needs_recovery() -> Result<bool> {
+    win::startup_topology_needs_recovery_impl()
+}
+
+#[cfg(windows)]
+pub fn ensure_layout_available(layout: &MonitorLayout) -> Result<()> {
+    win::ensure_layout_available_impl(layout)
 }

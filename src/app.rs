@@ -30,7 +30,7 @@ pub struct MonManApp {
 
 impl MonManApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let (config, mut status, mut status_is_error) = match storage::load() {
+        let (mut config, mut status, mut status_is_error) = match storage::load() {
             Ok(config) => (config, "Ready".to_string(), false),
             Err(err) => (
                 AppConfig::default(),
@@ -38,6 +38,57 @@ impl MonManApp {
                 true,
             ),
         };
+        let mut dirty = false;
+
+        if !status_is_error {
+            match display::startup_topology_needs_recovery() {
+                Ok(true) => {
+                    if let Some(fallback) = config.last_known_working.clone() {
+                        match display::ensure_layout_available(&fallback) {
+                            Ok(()) => match display::apply_layout(&fallback) {
+                                Ok(()) => {
+                                    config.last_known_working = Some(working_snapshot(&fallback));
+                                    dirty = true;
+                                    status = "Recovered the last known working monitor topology because Windows had no available active display".into();
+                                }
+                                Err(error) => {
+                                    status = format!(
+                                        "Startup monitor recovery failed while applying the last known working topology: {error:#}"
+                                    );
+                                    status_is_error = true;
+                                }
+                            },
+                            Err(error) => {
+                                status = format!(
+                                    "Startup monitor recovery was skipped because the last known working topology is not currently available: {error:#}"
+                                );
+                                status_is_error = true;
+                            }
+                        }
+                    } else {
+                        status = "Windows has no available active display, but MonMan has not recorded a last known working topology yet".into();
+                        status_is_error = true;
+                    }
+                }
+                Ok(false) => match display::capture_layout("Last known working topology") {
+                    Ok(snapshot) if snapshot.monitors.iter().any(|monitor| monitor.enabled) => {
+                        config.last_known_working = Some(sanitized_working_snapshot(snapshot));
+                        dirty = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        status =
+                            format!("Could not record the current working topology: {error:#}");
+                        status_is_error = true;
+                    }
+                },
+                Err(error) => {
+                    status = format!("Could not inspect the startup monitor topology: {error:#}");
+                    status_is_error = true;
+                }
+            }
+        }
+
         let selected = (!config.layouts.is_empty()).then_some(0);
         let hotkeys = HotkeyManager::new(cc.egui_ctx.clone());
         let controllers = ControllerManager::new(cc.egui_ctx.clone());
@@ -66,7 +117,7 @@ impl MonManApp {
             exit_requested: false,
             status,
             status_is_error,
-            dirty: false,
+            dirty,
             last_persist: Instant::now(),
             undo_layout: None,
         };
@@ -331,11 +382,13 @@ impl MonManApp {
         match display::apply_layout(&layout) {
             Ok(()) => {
                 self.undo_layout = Some(previous);
+                self.remember_working_layout(&layout);
                 self.status = format!("Applied '{name}'");
                 self.status_is_error = false;
             }
             Err(apply_err) => match display::apply_layout(&previous) {
                 Ok(()) => {
+                    self.remember_working_layout(&previous);
                     self.status = format!(
                         "Could not apply '{name}': {apply_err:#}. The previous topology was restored."
                     );
@@ -358,6 +411,7 @@ impl MonManApp {
 
         match display::apply_layout(&previous) {
             Ok(()) => {
+                self.remember_working_layout(&previous);
                 self.undo_layout = None;
                 self.status = "Restored the topology from before the last successful apply".into();
                 self.status_is_error = false;
@@ -474,6 +528,11 @@ impl MonManApp {
         }
         self.controller_capture_layout = None;
         self.controller_capture_status.clear();
+    }
+
+    fn remember_working_layout(&mut self, applied: &MonitorLayout) {
+        self.config.last_known_working = Some(working_snapshot(applied));
+        self.dirty = true;
     }
 
     fn handle_tray(&mut self, ctx: &egui::Context) {
@@ -997,6 +1056,7 @@ impl eframe::App for MonManApp {
         self.handle_hotkeys();
         self.handle_controllers();
         self.handle_tray(ctx);
+        self.persist(ctx);
 
         if ctx.input(|input| input.viewport().close_requested()) && !self.exit_requested {
             if self.tray.is_some() {
@@ -1013,7 +1073,6 @@ impl eframe::App for MonManApp {
         self.sidebar(ui);
         self.status_bar(ui);
         self.editor(ui);
-        self.persist(ui.ctx());
     }
 
     fn on_exit(&mut self) {
@@ -1023,6 +1082,19 @@ impl eframe::App for MonManApp {
             let _ = storage::save(&self.config);
         }
     }
+}
+
+fn working_snapshot(fallback: &MonitorLayout) -> MonitorLayout {
+    display::capture_layout("Last known working topology")
+        .map(sanitized_working_snapshot)
+        .unwrap_or_else(|_| sanitized_working_snapshot(fallback.clone()))
+}
+
+fn sanitized_working_snapshot(mut layout: MonitorLayout) -> MonitorLayout {
+    layout.name = "Last known working topology".into();
+    layout.hotkey = None;
+    layout.controller_hotkey = None;
+    layout
 }
 
 const DISPLAY_ROTATIONS: [(i32, &str); 4] = [

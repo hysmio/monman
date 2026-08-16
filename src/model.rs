@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     #[serde(default)]
     pub layouts: Vec<MonitorLayout>,
+    /// Most recent topology that was observed after a healthy startup or a
+    /// successful apply. It is separate from user layouts and has no hotkey.
+    #[serde(default)]
+    pub last_known_working: Option<MonitorLayout>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,5 +329,13 @@ mod tests {
 
         assert_ne!(first.stable_key(), second.stable_key());
         assert!(!first.matches(&second));
+    }
+
+    #[test]
+    fn older_config_files_default_to_no_recovery_snapshot() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"layouts":[]}"#).expect("legacy config should load");
+
+        assert!(config.last_known_working.is_none());
     }
 }
