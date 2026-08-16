@@ -1,3 +1,6 @@
+use crate::controllers::{
+    ControllerDeviceInfo, ControllerEvent, ControllerManager, ControllerSpec,
+};
 use crate::display;
 use crate::hotkeys::{HotkeyEvent, HotkeyManager, HotkeySpec};
 use crate::model::{AppConfig, HotkeyBinding, HotkeyKey, MonitorLayout};
@@ -10,6 +13,10 @@ pub struct MonManApp {
     config: AppConfig,
     selected: Option<usize>,
     hotkeys: HotkeyManager,
+    controllers: ControllerManager,
+    controller_devices: Vec<ControllerDeviceInfo>,
+    controller_capture_layout: Option<usize>,
+    controller_capture_status: String,
     tray: Option<TrayManager>,
     exit_requested: bool,
     status: String,
@@ -31,9 +38,9 @@ impl MonManApp {
                 true,
             ),
         };
-
         let selected = (!config.layouts.is_empty()).then_some(0);
         let hotkeys = HotkeyManager::new(cc.egui_ctx.clone());
+        let controllers = ControllerManager::new(cc.egui_ctx.clone());
         let tray = match TrayManager::new(cc.egui_ctx.clone()) {
             Ok(tray) => {
                 if !status_is_error {
@@ -51,6 +58,10 @@ impl MonManApp {
             config,
             selected,
             hotkeys,
+            controllers,
+            controller_devices: Vec::new(),
+            controller_capture_layout: None,
+            controller_capture_status: String::new(),
             tray,
             exit_requested: false,
             status,
@@ -60,6 +71,7 @@ impl MonManApp {
             undo_layout: None,
         };
         app.refresh_hotkeys();
+        app.refresh_controller_hotkeys();
         app
     }
 
@@ -79,6 +91,30 @@ impl MonManApp {
 
         if let Err(err) = self.hotkeys.replace(specs) {
             self.status = format!("Could not update global hotkeys: {err:#}");
+            self.status_is_error = true;
+        }
+    }
+
+    fn refresh_controller_hotkeys(&mut self) {
+        let specs = self
+            .config
+            .layouts
+            .iter()
+            .enumerate()
+            .filter_map(|(layout_index, layout)| {
+                layout
+                    .controller_hotkey
+                    .clone()
+                    .filter(|binding| binding.is_valid())
+                    .map(|binding| ControllerSpec {
+                        layout_index,
+                        binding,
+                    })
+            })
+            .collect();
+
+        if let Err(err) = self.controllers.replace(specs) {
+            self.status = format!("Could not update controller hotkeys: {err:#}");
             self.status_is_error = true;
         }
     }
@@ -173,9 +209,11 @@ impl MonManApp {
 
         let old_name = self.config.layouts[index].name.clone();
         let old_hotkey = self.config.layouts[index].hotkey;
+        let old_controller_hotkey = self.config.layouts[index].controller_hotkey.clone();
         match display::capture_layout(old_name) {
             Ok(mut layout) => {
                 layout.hotkey = old_hotkey;
+                layout.controller_hotkey = old_controller_hotkey;
                 self.config.layouts[index] = layout;
                 self.dirty = true;
                 self.status = "Replaced this layout with the current desktop topology".into();
@@ -259,12 +297,14 @@ impl MonManApp {
         let mut copy = layout;
         copy.name = format!("{} copy", copy.name);
         copy.hotkey = None;
+        copy.controller_hotkey = None;
         self.config.layouts.insert(index + 1, copy);
         self.selected = Some(index + 1);
         self.dirty = true;
-        self.status = "Duplicated layout (hotkey cleared on the copy)".into();
+        self.status = "Duplicated layout (hotkeys cleared on the copy)".into();
         self.status_is_error = false;
         self.refresh_hotkeys();
+        self.refresh_controller_hotkeys();
     }
 
     fn apply_index(&mut self, index: usize) {
@@ -370,6 +410,72 @@ impl MonManApp {
         }
     }
 
+    fn handle_controllers(&mut self) {
+        while let Some(event) = self.controllers.try_recv() {
+            match event {
+                ControllerEvent::Triggered(index) => self.apply_index(index),
+                ControllerEvent::Captured {
+                    layout_index,
+                    binding,
+                } => {
+                    self.controller_capture_layout = None;
+                    self.controller_capture_status.clear();
+                    if let Some(layout) = self.config.layouts.get_mut(layout_index) {
+                        let label = binding.label();
+                        layout.controller_hotkey = Some(binding);
+                        self.dirty = true;
+                        self.refresh_controller_hotkeys();
+                        self.status = format!("Controller hotkey saved: {label}");
+                        self.status_is_error = false;
+                    }
+                }
+                ControllerEvent::CaptureProgress(message) => {
+                    self.controller_capture_status = message;
+                }
+                ControllerEvent::CaptureCancelled(message) => {
+                    self.controller_capture_layout = None;
+                    self.controller_capture_status.clear();
+                    self.status = message;
+                    self.status_is_error = false;
+                }
+                ControllerEvent::DevicesChanged(devices) => {
+                    self.controller_devices = devices;
+                }
+                ControllerEvent::Error(error) => {
+                    self.controller_capture_layout = None;
+                    self.controller_capture_status.clear();
+                    self.status = error;
+                    self.status_is_error = true;
+                }
+            }
+        }
+    }
+
+    fn begin_controller_capture(&mut self, layout_index: usize) {
+        match self.controllers.begin_capture(layout_index) {
+            Ok(()) => {
+                self.controller_capture_layout = Some(layout_index);
+                self.controller_capture_status =
+                    "Release all controller buttons, then press the desired chord".into();
+                self.status = "Listening for a controller hotkey".into();
+                self.status_is_error = false;
+            }
+            Err(error) => {
+                self.status = format!("Could not start controller binding: {error:#}");
+                self.status_is_error = true;
+            }
+        }
+    }
+
+    fn cancel_controller_capture(&mut self) {
+        if let Err(error) = self.controllers.cancel_capture() {
+            self.status = format!("Could not cancel controller binding: {error:#}");
+            self.status_is_error = true;
+        }
+        self.controller_capture_layout = None;
+        self.controller_capture_status.clear();
+    }
+
     fn handle_tray(&mut self, ctx: &egui::Context) {
         let mut tray_failed = false;
         while let Some(event) = self.tray.as_ref().and_then(TrayManager::try_recv) {
@@ -395,8 +501,7 @@ impl MonManApp {
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         if self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.status =
-                "MonMan is running in the system tray; global hotkeys remain active".into();
+            self.status = "MonMan is running in the system tray; keyboard and controller hotkeys remain active".into();
             self.status_is_error = false;
         }
     }
@@ -428,10 +533,15 @@ impl MonManApp {
                             .hotkey
                             .map(|h| format!("  [{}]", h.label()))
                             .unwrap_or_default();
+                        let controller = layout
+                            .controller_hotkey
+                            .as_ref()
+                            .map(|_| "  [controller]")
+                            .unwrap_or_default();
                         if ui
                             .selectable_label(
                                 self.selected == Some(index),
-                                format!("{}{}", layout.name, hotkey),
+                                format!("{}{}{}", layout.name, hotkey, controller),
                             )
                             .clicked()
                         {
@@ -446,7 +556,9 @@ impl MonManApp {
                     }
                     if ui
                         .add_enabled(self.tray.is_some(), egui::Button::new("Hide to tray"))
-                        .on_hover_text("Hide the window while keeping global hotkeys active")
+                        .on_hover_text(
+                            "Hide the window while keeping keyboard and controller hotkeys active",
+                        )
                         .clicked()
                     {
                         self.hide_to_tray(ui.ctx());
@@ -490,8 +602,19 @@ impl MonManApp {
             let mut sync_monitors = false;
             let mut duplicate = false;
             let mut hotkeys_changed = false;
+            let mut controller_binding_changed = false;
+            let mut begin_controller_capture = false;
+            let mut cancel_controller_capture = false;
             let mut make_primary = None::<usize>;
             let mut clone_geometry_update = None::<(usize, Option<u32>, i32, i32, u32, u32)>;
+            let capture_active = self.controller_capture_layout == Some(index);
+            let capture_elsewhere = self.controller_capture_layout.is_some() && !capture_active;
+            let capture_status = self.controller_capture_status.clone();
+            let connected_controllers = self
+                .controller_devices
+                .iter()
+                .map(ControllerDeviceInfo::label)
+                .collect::<Vec<_>>();
 
             {
                 let layout = &mut self.config.layouts[index];
@@ -558,6 +681,74 @@ impl MonManApp {
                             self.dirty = true;
                         }
                     }
+                });
+
+                ui.add_space(8.0);
+                ui.group(|ui| {
+                    ui.strong("Controller hotkey");
+                    let binding_label = layout
+                        .controller_hotkey
+                        .as_ref()
+                        .map(|binding| binding.label());
+
+                    if let Some(label) = binding_label {
+                        ui.label(label);
+                    } else {
+                        ui.label("No controller chord assigned to this layout.");
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        if capture_active {
+                            ui.spinner();
+                            if ui.button("Cancel listening").clicked() {
+                                cancel_controller_capture = true;
+                            }
+                        } else {
+                            let text = if layout.controller_hotkey.is_some() {
+                                "Rebind controller chord"
+                            } else {
+                                "Bind controller chord"
+                            };
+                            if ui
+                                .add_enabled(!capture_elsewhere, egui::Button::new(text))
+                                .on_hover_text(
+                                    "Release all buttons, press one button or a chord, then release it to save",
+                                )
+                                .clicked()
+                            {
+                                begin_controller_capture = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    layout.controller_hotkey.is_some(),
+                                    egui::Button::new("Clear"),
+                                )
+                                .clicked()
+                            {
+                                layout.controller_hotkey = None;
+                                controller_binding_changed = true;
+                                self.dirty = true;
+                            }
+                        }
+                    });
+
+                    if capture_active {
+                        ui.colored_label(ui.visuals().warn_fg_color, capture_status);
+                    } else if capture_elsewhere {
+                        ui.small("Controller listening is active for another layout.");
+                    }
+
+                    if connected_controllers.is_empty() {
+                        ui.small("No Windows game controller is currently connected.");
+                    } else {
+                        ui.small(format!(
+                            "Connected: {}",
+                            connected_controllers.join(", ")
+                        ));
+                    }
+                    ui.small(
+                        "Controller hotkeys keep working while MonMan is hidden in the system tray.",
+                    );
                 });
 
                 ui.add_space(10.0);
@@ -730,8 +921,22 @@ impl MonManApp {
             if hotkeys_changed {
                 self.refresh_hotkeys();
             }
+            if controller_binding_changed {
+                self.refresh_controller_hotkeys();
+                self.status = "Controller hotkey cleared".into();
+                self.status_is_error = false;
+            }
+            if cancel_controller_capture {
+                self.cancel_controller_capture();
+            }
+            if begin_controller_capture {
+                self.begin_controller_capture(index);
+            }
 
             if delete {
+                if self.controller_capture_layout.is_some() {
+                    self.cancel_controller_capture();
+                }
                 self.config.layouts.remove(index);
                 self.selected = if self.config.layouts.is_empty() {
                     None
@@ -740,6 +945,7 @@ impl MonManApp {
                 };
                 self.dirty = true;
                 self.refresh_hotkeys();
+                self.refresh_controller_hotkeys();
                 self.status = "Deleted layout".into();
                 self.status_is_error = false;
                 return;
@@ -787,8 +993,9 @@ impl MonManApp {
 impl eframe::App for MonManApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe still runs logic after a repaint request while the native window
-        // is hidden. Global hotkeys therefore remain usable when MonMan is minimized.
+        // is hidden. Hotkeys therefore remain usable when MonMan is minimized.
         self.handle_hotkeys();
+        self.handle_controllers();
         self.handle_tray(ctx);
 
         if ctx.input(|input| input.viewport().close_requested()) && !self.exit_requested {
@@ -1273,6 +1480,7 @@ mod tests {
             name: "snap test".into(),
             monitors: vec![target, moving],
             hotkey: None,
+            controller_hotkey: None,
         };
 
         let top = snap_monitor_position(&layout, 1, 1090, 10, 20.0);

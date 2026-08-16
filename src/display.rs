@@ -152,6 +152,7 @@ mod win {
             name: name.into(),
             monitors,
             hotkey: None,
+            controller_hotkey: None,
         })
     }
 

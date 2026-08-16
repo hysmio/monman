@@ -13,6 +13,47 @@ pub struct MonitorLayout {
     pub monitors: Vec<MonitorConfig>,
     #[serde(default)]
     pub hotkey: Option<HotkeyBinding>,
+    #[serde(default)]
+    pub controller_hotkey: Option<ControllerBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerBinding {
+    pub vendor_id: u16,
+    pub product_id: u16,
+    #[serde(default)]
+    pub device_name: String,
+    #[serde(default)]
+    pub buttons: Vec<u32>,
+    #[serde(default)]
+    pub button_labels: Vec<String>,
+}
+
+impl ControllerBinding {
+    pub fn button_label(&self) -> String {
+        if self.button_labels.len() == self.buttons.len() && !self.button_labels.is_empty() {
+            self.button_labels.join(" + ")
+        } else {
+            self.buttons
+                .iter()
+                .map(|button| format!("Button {}", button + 1))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        }
+    }
+
+    pub fn label(&self) -> String {
+        let device = if self.device_name.is_empty() {
+            format!("Controller {:04X}:{:04X}", self.vendor_id, self.product_id)
+        } else {
+            self.device_name.clone()
+        };
+        format!("{device}: {}", self.button_label())
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.buttons.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

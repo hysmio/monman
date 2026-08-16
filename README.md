@@ -26,8 +26,10 @@ Windows, so Windows deactivates the display path.
   automatically.
 - Duplicate, rename, delete, explicitly save, and automatically save layouts.
 - Assign optional global hotkeys (at least one of `Ctrl` / `Alt` / `Shift` / `Win` + F1-F12 or 0-9).
+- Learn an optional DualSense controller button or multi-button chord for each
+  layout. Standard DualSense and DualSense Edge are supported over USB and Bluetooth.
 - Keep running in the Windows system tray when the GUI is closed, with Open and
-  Quit actions so global hotkeys remain available.
+  Quit actions so keyboard and controller hotkeys remain available.
 - Report global-hotkey registration failures in the GUI instead of silently ignoring
   reserved or conflicting shortcuts.
 - Capture the current topology before every apply, automatically attempt rollback on a failed two-stage apply, and offer **Undo last apply** after success.
@@ -88,8 +90,10 @@ The project currently targets Rust edition 2024 and uses `windows` 0.62.2 and
 4. Drag the monitor rectangles or edit coordinates, source resolution, orientation,
    and refresh rate in the grid.
 5. Use **Make primary** if needed.
-6. Optionally enable and choose a global hotkey.
-7. Click **Apply**.
+6. Optionally enable and choose a global keyboard hotkey.
+7. Optionally choose **Bind controller chord**, release all controller buttons,
+   press the desired DualSense button/chord, then release it to save the binding.
+8. Click **Apply**.
 
 Changes are saved to:
 
@@ -123,6 +127,14 @@ work. Double-click the tray icon to reopen the GUI, or right-click it and choose
 MonMan** or **Quit MonMan**. If Windows or another application already owns a shortcut,
 the failure is shown in MonMan's status bar.
 
+DualSense hotkeys use the Windows HID interface directly on a dedicated polling thread.
+This supports both the normal DualSense (`054C:0CE6`) and DualSense Edge (`054C:0DF2`)
+without relying on Windows `RawGameController` enumeration. Face buttons, D-pad,
+L1/R1/L2/R2, L3/R3, Create, Options, PS, touchpad click, and mute can be used alone or
+in chords. A chord triggers once when it becomes held and must be released before it can
+trigger again. Controllers are rescanned automatically, so they may be connected or
+woken after MonMan starts.
+
 ## Safety / limitations
 
 - At least one monitor must remain enabled; an all-off layout is rejected before any CCD
@@ -134,4 +146,5 @@ the failure is shown in MonMan's status bar.
 - DisplayConfig path scaling is captured/restored, but its GUI editing is not exposed yet.
 - Windows per-monitor DPI percentage is not the same field as DisplayConfig path scaling
   and is not currently edited by MonMan.
-- Use **Quit MonMan** from the tray menu or GUI when you want to stop global hotkeys.
+- Use **Quit MonMan** from the tray menu or GUI when you want to stop keyboard and
+  controller hotkeys.
