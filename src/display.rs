@@ -576,11 +576,26 @@ mod win {
             }
 
             if saved.refresh_hz >= 1.0 {
-                active.paths[path_index].targetInfo.refreshRate = saved_refresh_rational(saved);
+                set_path_refresh_rate(&mut active.paths[path_index], saved_refresh_rational(saved));
             }
         }
 
         Ok(())
+    }
+
+    fn set_path_refresh_rate(
+        path: &mut DISPLAYCONFIG_PATH_INFO,
+        refresh_rate: DISPLAYCONFIG_RATIONAL,
+    ) {
+        path.targetInfo.refreshRate = refresh_rate;
+
+        // QueryDisplayConfig supplied the target's current concrete timing mode.
+        // When that index remains valid, SetDisplayConfig uses the target mode's
+        // vSyncFreq instead of targetInfo.refreshRate, so a 60 Hz active mode wins
+        // over a requested 143.99 Hz. Keep the patched source mode, but omit the
+        // target mode so Windows' best-mode logic selects a supported timing for
+        // the requested refresh rate.
+        path.targetInfo.Anonymous.modeInfoIdx = INVALID_MODE_INDEX;
     }
 
     fn saved_refresh_rational(saved: &MonitorConfig) -> DISPLAYCONFIG_RATIONAL {
@@ -758,6 +773,25 @@ mod win {
             assert!(!topology_state_needs_recovery(&[true]));
             assert!(!topology_state_needs_recovery(&[false, false]));
             assert!(!topology_state_needs_recovery(&[false, true]));
+        }
+
+        #[test]
+        fn setting_refresh_invalidates_the_current_target_timing() {
+            let mut path = DISPLAYCONFIG_PATH_INFO::default();
+            path.targetInfo.Anonymous.modeInfoIdx = 7;
+            let requested = DISPLAYCONFIG_RATIONAL {
+                Numerator: 143_990,
+                Denominator: 1_000,
+            };
+
+            set_path_refresh_rate(&mut path, requested);
+
+            assert_eq!(path.targetInfo.refreshRate.Numerator, 143_990);
+            assert_eq!(path.targetInfo.refreshRate.Denominator, 1_000);
+            assert_eq!(
+                unsafe { path.targetInfo.Anonymous.modeInfoIdx },
+                INVALID_MODE_INDEX
+            );
         }
     }
 }
