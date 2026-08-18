@@ -8,13 +8,19 @@ mod controllers;
 mod display;
 mod hotkeys;
 mod model;
+mod single_instance;
 mod storage;
 mod tray;
 mod updater;
 
 use app::MonManApp;
 
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(_instance_guard) = single_instance::acquire()? else {
+        single_instance::show_existing_window();
+        return Ok(());
+    };
+
     let app_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/egui-icon.png"))
         .expect("bundled egui icon must be a valid PNG");
     let options = eframe::NativeOptions {
@@ -30,5 +36,6 @@ fn main() -> eframe::Result {
         "MonMan",
         options,
         Box::new(|cc| Ok(Box::new(MonManApp::new(cc)))),
-    )
+    )?;
+    Ok(())
 }
