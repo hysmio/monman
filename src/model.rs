@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     #[serde(default)]
     pub layouts: Vec<MonitorLayout>,
-    /// Most recent topology that was observed after a healthy startup or a
-    /// successful apply. It is separate from user layouts and has no hotkey.
+    /// Last healthy topology, kept separately from user layouts.
     #[serde(default)]
     pub last_known_working: Option<MonitorLayout>,
 }
@@ -70,12 +69,10 @@ pub struct MonitorConfig {
     pub source_id: u32,
     #[serde(default)]
     pub clone_group: Option<u32>,
-    /// Raw DISPLAYCONFIG_ROTATION value captured from the target path.
-    /// None keeps the currently available path value for older config files.
+    /// Raw `DISPLAYCONFIG_ROTATION`; `None` preserves the current value.
     #[serde(default)]
     pub rotation: Option<i32>,
-    /// Raw DISPLAYCONFIG_SCALING value captured from the target path.
-    /// This is source-to-target scaling, not Windows per-monitor DPI scaling.
+    /// Source-to-target `DISPLAYCONFIG_SCALING`, not DPI scaling.
     #[serde(default)]
     pub scaling: Option<i32>,
     pub x: i32,
@@ -83,8 +80,7 @@ pub struct MonitorConfig {
     pub width: u32,
     pub height: u32,
     pub refresh_hz: f32,
-    /// Exact rational captured from DISPLAYCONFIG_PATH_TARGET_INFO. Used while
-    /// refresh_hz still represents the same value, avoiding 59.94-style drift.
+    /// Exact captured refresh rate, retained while it matches `refresh_hz`.
     #[serde(default)]
     pub refresh_numerator: Option<u32>,
     #[serde(default)]
@@ -97,6 +93,16 @@ pub struct MonitorIdentity {
     pub adapter_low: u32,
     pub adapter_high: i32,
     pub target_id: u32,
+}
+
+impl MonitorConfig {
+    pub fn source_key(&self) -> (i32, u32, u32) {
+        (
+            self.source_adapter_high,
+            self.source_adapter_low,
+            self.source_id,
+        )
+    }
 }
 
 impl MonitorIdentity {
@@ -129,9 +135,7 @@ impl MonitorIdentity {
             );
         }
 
-        // A monitor interface path normally ends in the same Windows display
-        // interface class GUID for every monitor. Show the hardware and instance
-        // components instead; those are the useful distinguishing portions.
+        // The trailing interface GUID is shared; hardware and instance are unique.
         let mut parts = self.device_path.split('#');
         let _kind = parts.next();
         match (parts.next(), parts.next()) {
@@ -162,9 +166,10 @@ impl Default for HotkeyBinding {
     }
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HotkeyKey {
-    F1,
+    F1 = 0,
     F2,
     F3,
     F4,
@@ -215,56 +220,19 @@ impl HotkeyKey {
     ];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::F1 => "F1",
-            Self::F2 => "F2",
-            Self::F3 => "F3",
-            Self::F4 => "F4",
-            Self::F5 => "F5",
-            Self::F6 => "F6",
-            Self::F7 => "F7",
-            Self::F8 => "F8",
-            Self::F9 => "F9",
-            Self::F10 => "F10",
-            Self::F11 => "F11",
-            Self::F12 => "F12",
-            Self::Num0 => "0",
-            Self::Num1 => "1",
-            Self::Num2 => "2",
-            Self::Num3 => "3",
-            Self::Num4 => "4",
-            Self::Num5 => "5",
-            Self::Num6 => "6",
-            Self::Num7 => "7",
-            Self::Num8 => "8",
-            Self::Num9 => "9",
-        }
+        const LABELS: [&str; 22] = [
+            "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "0", "1",
+            "2", "3", "4", "5", "6", "7", "8", "9",
+        ];
+        LABELS[self as usize]
     }
 
     pub fn vk(self) -> u32 {
-        match self {
-            Self::F1 => 0x70,
-            Self::F2 => 0x71,
-            Self::F3 => 0x72,
-            Self::F4 => 0x73,
-            Self::F5 => 0x74,
-            Self::F6 => 0x75,
-            Self::F7 => 0x76,
-            Self::F8 => 0x77,
-            Self::F9 => 0x78,
-            Self::F10 => 0x79,
-            Self::F11 => 0x7A,
-            Self::F12 => 0x7B,
-            Self::Num0 => 0x30,
-            Self::Num1 => 0x31,
-            Self::Num2 => 0x32,
-            Self::Num3 => 0x33,
-            Self::Num4 => 0x34,
-            Self::Num5 => 0x35,
-            Self::Num6 => 0x36,
-            Self::Num7 => 0x37,
-            Self::Num8 => 0x38,
-            Self::Num9 => 0x39,
+        let index = self as u32;
+        if index < 12 {
+            0x70 + index
+        } else {
+            0x30 + index - 12
         }
     }
 }
@@ -337,5 +305,13 @@ mod tests {
             serde_json::from_str(r#"{"layouts":[]}"#).expect("legacy config should load");
 
         assert!(config.last_known_working.is_none());
+    }
+
+    #[test]
+    fn hotkey_labels_and_virtual_keys_keep_their_windows_ranges() {
+        assert_eq!((HotkeyKey::F1.label(), HotkeyKey::F1.vk()), ("F1", 0x70));
+        assert_eq!((HotkeyKey::F12.label(), HotkeyKey::F12.vk()), ("F12", 0x7b));
+        assert_eq!((HotkeyKey::Num0.label(), HotkeyKey::Num0.vk()), ("0", 0x30));
+        assert_eq!((HotkeyKey::Num9.label(), HotkeyKey::Num9.vk()), ("9", 0x39));
     }
 }

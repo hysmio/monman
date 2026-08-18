@@ -129,9 +129,7 @@ mod windows_impl {
     ) {
         let thread_id = unsafe { GetCurrentThreadId() };
 
-        // A thread does not own a Windows message queue until it calls a user/GDI
-        // function that creates one. Create it before publishing the thread id so
-        // PostThreadMessageW cannot race startup.
+        // Create the message queue before publishing the thread ID.
         let mut bootstrap = MSG::default();
         unsafe {
             let _ = windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
@@ -155,30 +153,20 @@ mod windows_impl {
             }
 
             if msg.message == WM_MONMAN_COMMAND {
-                // Coalesce rapid UI edits and only register the newest requested set.
-                // RegisterHotKey creates a system-wide shortcut, so cycling through
-                // intermediate edits only creates needless transient conflicts.
+                // Register only the newest edit to avoid transient global conflicts.
                 let mut newest_specs = None::<Vec<HotkeySpec>>;
                 while let Ok(command) = command_rx.try_recv() {
                     match command {
                         Command::Replace(specs) => newest_specs = Some(specs),
                         Command::Stop => {
-                            for id in registered_ids.drain(..) {
-                                unsafe {
-                                    let _ = UnregisterHotKey(None, id);
-                                }
-                            }
+                            unregister_all(&mut registered_ids);
                             return;
                         }
                     }
                 }
 
                 if let Some(specs) = newest_specs {
-                    for id in registered_ids.drain(..) {
-                        unsafe {
-                            let _ = UnregisterHotKey(None, id);
-                        }
-                    }
+                    unregister_all(&mut registered_ids);
                     id_to_layout.clear();
 
                     let mut failures = Vec::new();
@@ -224,7 +212,11 @@ mod windows_impl {
             }
         }
 
-        for id in registered_ids {
+        unregister_all(&mut registered_ids);
+    }
+
+    fn unregister_all(ids: &mut Vec<i32>) {
+        for id in ids.drain(..) {
             unsafe {
                 let _ = UnregisterHotKey(None, id);
             }

@@ -90,17 +90,19 @@ impl ControllerManager {
     }
 
     pub fn replace(&self, specs: Vec<ControllerSpec>) -> anyhow::Result<()> {
-        self.command_tx.send(Command::Replace(specs))?;
-        Ok(())
+        self.send(Command::Replace(specs))
     }
 
     pub fn begin_capture(&self, layout_index: usize) -> anyhow::Result<()> {
-        self.command_tx.send(Command::BeginCapture(layout_index))?;
-        Ok(())
+        self.send(Command::BeginCapture(layout_index))
     }
 
     pub fn cancel_capture(&self) -> anyhow::Result<()> {
-        self.command_tx.send(Command::CancelCapture)?;
+        self.send(Command::CancelCapture)
+    }
+
+    fn send(&self, command: Command) -> anyhow::Result<()> {
+        self.command_tx.send(command)?;
         Ok(())
     }
 
@@ -130,7 +132,7 @@ mod windows_impl {
     const DEVICE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(15);
 
-    // Button IDs are intentionally stable because they are persisted in layouts.json.
+    // Persisted button IDs; keep these values and names in order.
     const CROSS: u32 = 0;
     const CIRCLE: u32 = 1;
     const SQUARE: u32 = 2;
@@ -150,16 +152,32 @@ mod windows_impl {
     const PS: u32 = 16;
     const TOUCHPAD: u32 = 17;
     const MUTE: u32 = 18;
+    const BUTTON_NAMES: [&str; 19] = [
+        "Cross",
+        "Circle",
+        "Square",
+        "Triangle",
+        "D-pad Up",
+        "D-pad Down",
+        "D-pad Left",
+        "D-pad Right",
+        "L1",
+        "R1",
+        "L2",
+        "R2",
+        "Create",
+        "Options",
+        "L3",
+        "R3",
+        "PS",
+        "Touchpad",
+        "Mute",
+    ];
 
     struct Device {
         id: String,
         info: ControllerDeviceInfo,
         device: HidDevice,
-        pressed: BTreeSet<u32>,
-    }
-
-    struct Reading {
-        device_index: usize,
         pressed: BTreeSet<u32>,
     }
 
@@ -175,6 +193,16 @@ mod windows_impl {
             device_id: String,
             buttons: BTreeSet<u32>,
         },
+    }
+
+    impl CaptureState {
+        fn deadline(&self) -> Instant {
+            match self {
+                Self::AwaitingRelease { deadline, .. } | Self::Collecting { deadline, .. } => {
+                    *deadline
+                }
+            }
+        }
     }
 
     pub(super) fn controller_thread(
@@ -258,19 +286,10 @@ mod windows_impl {
                 continue;
             }
 
-            let readings = devices
-                .iter()
-                .enumerate()
-                .map(|(device_index, device)| Reading {
-                    device_index,
-                    pressed: device.pressed.clone(),
-                })
-                .collect::<Vec<_>>();
-
             if capture.is_some() {
-                update_capture(&mut capture, &devices, &readings, &ctx, &event_tx);
+                update_capture(&mut capture, &devices, &ctx, &event_tx);
             } else {
-                update_hotkeys(&specs, &mut active, &devices, &readings, &ctx, &event_tx);
+                update_hotkeys(&specs, &mut active, &devices, &ctx, &event_tx);
             }
         }
     }
@@ -392,9 +411,7 @@ mod windows_impl {
         }
     }
 
-    // DualSense USB reports contain a one-byte report ID. Bluetooth reports
-    // contain the report ID plus a one-byte transport header. The remaining
-    // payload has the same button offsets on both transports and on Edge.
+    // Strip the USB/Bluetooth headers to expose their shared button payload.
     fn extract_report(report: &[u8]) -> Option<&[u8]> {
         match report.len() {
             63 => Some(report),
@@ -416,35 +433,18 @@ mod windows_impl {
         let button1 = report[8];
         let button2 = report[9];
 
-        add_if(&mut pressed, button0 & (1 << 4) != 0, SQUARE);
-        add_if(&mut pressed, button0 & (1 << 5) != 0, CROSS);
-        add_if(&mut pressed, button0 & (1 << 6) != 0, CIRCLE);
-        add_if(&mut pressed, button0 & (1 << 7) != 0, TRIANGLE);
+        for (bit, button) in [(4, SQUARE), (5, CROSS), (6, CIRCLE), (7, TRIANGLE)] {
+            add_if(&mut pressed, button0 & (1 << bit) != 0, button);
+        }
         match button0 & 0x0f {
-            0 => {
-                pressed.insert(DPAD_UP);
-            }
-            1 => {
-                pressed.extend([DPAD_UP, DPAD_RIGHT]);
-            }
-            2 => {
-                pressed.insert(DPAD_RIGHT);
-            }
-            3 => {
-                pressed.extend([DPAD_DOWN, DPAD_RIGHT]);
-            }
-            4 => {
-                pressed.insert(DPAD_DOWN);
-            }
-            5 => {
-                pressed.extend([DPAD_DOWN, DPAD_LEFT]);
-            }
-            6 => {
-                pressed.insert(DPAD_LEFT);
-            }
-            7 => {
-                pressed.extend([DPAD_UP, DPAD_LEFT]);
-            }
+            0 => pressed.extend([DPAD_UP]),
+            1 => pressed.extend([DPAD_UP, DPAD_RIGHT]),
+            2 => pressed.extend([DPAD_RIGHT]),
+            3 => pressed.extend([DPAD_DOWN, DPAD_RIGHT]),
+            4 => pressed.extend([DPAD_DOWN]),
+            5 => pressed.extend([DPAD_DOWN, DPAD_LEFT]),
+            6 => pressed.extend([DPAD_LEFT]),
+            7 => pressed.extend([DPAD_UP, DPAD_LEFT]),
             _ => {}
         }
 
@@ -475,49 +475,46 @@ mod windows_impl {
     fn update_capture(
         capture: &mut Option<CaptureState>,
         devices: &[Device],
-        readings: &[Reading],
         ctx: &eframe::egui::Context,
         event_tx: &Sender<ControllerEvent>,
     ) {
-        let now = Instant::now();
         let Some(state) = capture.take() else { return };
+        if Instant::now() >= state.deadline() {
+            send(
+                ctx,
+                event_tx,
+                ControllerEvent::CaptureCancelled(
+                    "Controller binding timed out after 15 seconds".into(),
+                ),
+            );
+            return;
+        }
+
         match state {
             CaptureState::AwaitingRelease {
                 layout_index,
                 deadline,
                 mut armed,
             } => {
-                if now >= deadline {
-                    send(
-                        ctx,
-                        event_tx,
-                        ControllerEvent::CaptureCancelled(
-                            "Controller binding timed out after 15 seconds".into(),
-                        ),
-                    );
-                    return;
-                }
-                if readings.iter().all(|reading| reading.pressed.is_empty()) {
+                if devices.iter().all(|device| device.pressed.is_empty()) {
                     armed = true;
                 }
                 if armed
-                    && let Some(reading) =
-                        readings.iter().find(|reading| !reading.pressed.is_empty())
+                    && let Some(device) = devices.iter().find(|device| !device.pressed.is_empty())
                 {
-                    let device = &devices[reading.device_index];
                     send(
                         ctx,
                         event_tx,
                         ControllerEvent::CaptureProgress(format!(
                             "Recording {} — release the chord to save it",
-                            buttons_label(&reading.pressed)
+                            buttons_label(&device.pressed)
                         )),
                     );
                     *capture = Some(CaptureState::Collecting {
                         layout_index,
                         deadline,
                         device_id: device.id.clone(),
-                        buttons: reading.pressed.clone(),
+                        buttons: device.pressed.clone(),
                     });
                 } else {
                     *capture = Some(CaptureState::AwaitingRelease {
@@ -533,21 +530,7 @@ mod windows_impl {
                 device_id,
                 mut buttons,
             } => {
-                if now >= deadline {
-                    send(
-                        ctx,
-                        event_tx,
-                        ControllerEvent::CaptureCancelled(
-                            "Controller binding timed out after 15 seconds".into(),
-                        ),
-                    );
-                    return;
-                }
-                let Some((device_index, device)) = devices
-                    .iter()
-                    .enumerate()
-                    .find(|(_, device)| device.id == device_id)
-                else {
+                let Some(device) = devices.iter().find(|device| device.id == device_id) else {
                     send(
                         ctx,
                         event_tx,
@@ -557,21 +540,8 @@ mod windows_impl {
                     );
                     return;
                 };
-                let Some(pressed) = readings
-                    .iter()
-                    .find(|reading| reading.device_index == device_index)
-                    .map(|reading| &reading.pressed)
-                else {
-                    *capture = Some(CaptureState::Collecting {
-                        layout_index,
-                        deadline,
-                        device_id,
-                        buttons,
-                    });
-                    return;
-                };
-                buttons.extend(pressed);
-                if pressed.is_empty() {
+                buttons.extend(&device.pressed);
+                if device.pressed.is_empty() {
                     let button_vec = buttons.iter().copied().collect::<Vec<_>>();
                     let button_labels = button_vec
                         .iter()
@@ -607,21 +577,19 @@ mod windows_impl {
         specs: &[ControllerSpec],
         active: &mut HashMap<usize, bool>,
         devices: &[Device],
-        readings: &[Reading],
         ctx: &eframe::egui::Context,
         event_tx: &Sender<ControllerEvent>,
     ) {
         let mut triggered = None;
         for spec in specs {
-            let is_active = readings.iter().any(|reading| {
-                let device = &devices[reading.device_index];
+            let is_active = devices.iter().any(|device| {
                 device.info.vendor_id == spec.binding.vendor_id
                     && device.info.product_id == spec.binding.product_id
                     && spec
                         .binding
                         .buttons
                         .iter()
-                        .all(|button| reading.pressed.contains(button))
+                        .all(|button| device.pressed.contains(button))
             });
             let was_active = active.insert(spec.layout_index, is_active).unwrap_or(false);
             if is_active && !was_active && triggered.is_none() {
@@ -642,28 +610,10 @@ mod windows_impl {
     }
 
     fn button_name(button: u32) -> &'static str {
-        match button {
-            CROSS => "Cross",
-            CIRCLE => "Circle",
-            SQUARE => "Square",
-            TRIANGLE => "Triangle",
-            DPAD_UP => "D-pad Up",
-            DPAD_DOWN => "D-pad Down",
-            DPAD_LEFT => "D-pad Left",
-            DPAD_RIGHT => "D-pad Right",
-            L1 => "L1",
-            R1 => "R1",
-            L2 => "L2",
-            R2 => "R2",
-            CREATE => "Create",
-            OPTIONS => "Options",
-            L3 => "L3",
-            R3 => "R3",
-            PS => "PS",
-            TOUCHPAD => "Touchpad",
-            MUTE => "Mute",
-            _ => "Unknown button",
-        }
+        BUTTON_NAMES
+            .get(button as usize)
+            .copied()
+            .unwrap_or("Unknown button")
     }
 
     fn send(
@@ -696,6 +646,13 @@ mod windows_impl {
                 parse_buttons(&report),
                 BTreeSet::from([DPAD_UP, DPAD_RIGHT])
             );
+        }
+
+        #[test]
+        fn persisted_button_ids_still_match_their_names() {
+            assert_eq!(button_name(CROSS), "Cross");
+            assert_eq!(button_name(MUTE), "Mute");
+            assert_eq!(button_name(MUTE + 1), "Unknown button");
         }
     }
 }

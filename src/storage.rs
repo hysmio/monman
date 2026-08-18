@@ -23,7 +23,10 @@ fn backup_path(path: &Path) -> PathBuf {
 fn read_config(path: &Path) -> Result<AppConfig> {
     let data =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&data).with_context(|| format!("failed to parse {}", path.display()))
+    let mut config = serde_json::from_str(&data)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    migrate_legacy_clone_groups(&mut config);
+    Ok(config)
 }
 
 pub fn load() -> Result<AppConfig> {
@@ -31,27 +34,18 @@ pub fn load() -> Result<AppConfig> {
     let backup = backup_path(&path);
 
     if !path.exists() {
-        if backup.exists() {
-            let mut config = read_config(&backup)
-                .context("primary config is missing and backup recovery failed")?;
-            migrate_legacy_clone_groups(&mut config);
-            return Ok(config);
-        }
-        return Ok(AppConfig::default());
+        return if backup.exists() {
+            read_config(&backup).context("primary config is missing and backup recovery failed")
+        } else {
+            Ok(AppConfig::default())
+        };
     }
 
     match read_config(&path) {
-        Ok(mut config) => {
-            migrate_legacy_clone_groups(&mut config);
-            Ok(config)
-        }
-        Err(primary_err) if backup.exists() => {
-            let mut config = read_config(&backup).with_context(|| {
-                format!("primary config failed ({primary_err:#}) and backup recovery also failed")
-            })?;
-            migrate_legacy_clone_groups(&mut config);
-            Ok(config)
-        }
+        Ok(config) => Ok(config),
+        Err(primary_err) if backup.exists() => read_config(&backup).with_context(|| {
+            format!("primary config failed ({primary_err:#}) and backup recovery also failed")
+        }),
         Err(err) => Err(err),
     }
 }
@@ -65,8 +59,7 @@ pub fn save(config: &AppConfig) -> Result<()> {
 
     let data = serde_json::to_string_pretty(config)?;
 
-    // Keep the last known parseable config before replacing the primary file.
-    // This makes a partial/interrupted primary write recoverable on the next launch.
+    // Keep a parseable backup in case the next write is interrupted.
     if path.exists() && read_config(&path).is_ok() {
         let backup = backup_path(&path);
         fs::copy(&path, &backup).with_context(|| {
@@ -96,19 +89,13 @@ fn migrate_legacy_clone_groups(config: &mut AppConfig) {
         for (index, monitor) in layout.monitors.iter().enumerate() {
             if monitor.enabled && monitor.clone_group.is_none() {
                 by_source
-                    .entry((
-                        monitor.source_adapter_high,
-                        monitor.source_adapter_low,
-                        monitor.source_id,
-                    ))
+                    .entry(monitor.source_key())
                     .or_default()
                     .push(index);
             }
         }
 
-        // In legacy files, equal source ids among *active* monitors can only mean
-        // cloning. Inactive path source ids are intentionally ignored because they
-        // merely represented possible routing choices in QDC_ALL_PATHS.
+        // Only active legacy paths sharing a source represent clones.
         for indices in by_source.into_values().filter(|indices| indices.len() > 1) {
             let group = next_group;
             next_group = next_group.saturating_add(1);
