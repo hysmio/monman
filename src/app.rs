@@ -3,9 +3,10 @@ use crate::controllers::{
 };
 use crate::display;
 use crate::hotkeys::{HotkeyEvent, HotkeyManager, HotkeySpec};
-use crate::model::{AppConfig, HotkeyBinding, HotkeyKey, MonitorLayout};
+use crate::model::{AppConfig, HotkeyBinding, HotkeyKey, MonitorConfig, MonitorLayout};
 use crate::storage;
 use crate::tray::{TrayEvent, TrayManager};
+use crate::updater::{AvailableUpdate, UpdateEvent, UpdateManager};
 use eframe::egui;
 use std::time::{Duration, Instant};
 
@@ -18,56 +19,108 @@ pub struct MonManApp {
     controller_capture_layout: Option<usize>,
     controller_capture_status: String,
     tray: Option<TrayManager>,
+    updater: UpdateManager,
+    available_update: Option<AvailableUpdate>,
+    update_in_progress: bool,
     exit_requested: bool,
-    status: String,
-    status_is_error: bool,
+    status: AppStatus,
     dirty: bool,
     last_persist: Instant,
-    /// Snapshot captured immediately before the most recent successful apply.
-    /// Kept in memory only; it is a safety escape hatch rather than a saved layout.
+    /// In-memory rollback point for the most recent apply.
     undo_layout: Option<MonitorLayout>,
+}
+
+struct AppStatus {
+    message: String,
+    is_error: bool,
+}
+
+impl AppStatus {
+    fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_error: false,
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            is_error: true,
+        }
+    }
 }
 
 impl MonManApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let (mut config, mut status, mut status_is_error) = match storage::load() {
-            Ok(config) => (config, "Ready".to_string(), false),
+        let (mut config, mut status) = match storage::load() {
+            Ok(config) => (config, AppStatus::info("Ready")),
             Err(err) => (
                 AppConfig::default(),
-                format!("Could not load layouts: {err:#}"),
-                true,
+                AppStatus::error(format!("Could not load layouts: {err:#}")),
             ),
         };
         let mut dirty = false;
 
-        if !status_is_error {
+        if !status.is_error {
             match display::startup_topology_needs_recovery() {
                 Ok(true) => {
-                    if let Some(fallback) = config.last_known_working.clone() {
-                        match display::ensure_layout_available(&fallback) {
-                            Ok(()) => match display::apply_layout(&fallback) {
-                                Ok(()) => {
-                                    config.last_known_working = Some(working_snapshot(&fallback));
-                                    dirty = true;
-                                    status = "Recovered the last known working monitor topology because Windows had no available active display".into();
-                                }
-                                Err(error) => {
-                                    status = format!(
-                                        "Startup monitor recovery failed while applying the last known working topology: {error:#}"
-                                    );
-                                    status_is_error = true;
-                                }
-                            },
-                            Err(error) => {
-                                status = format!(
-                                    "Startup monitor recovery was skipped because the last known working topology is not currently available: {error:#}"
-                                );
-                                status_is_error = true;
-                            }
+                    let saved_recovery = config.last_known_working.clone().map(|fallback| {
+                        display::ensure_layout_available(&fallback)
+                            .and_then(|()| display::apply_layout(&fallback))
+                            .map(|()| fallback)
+                    });
+
+                    match saved_recovery {
+                        Some(Ok(fallback)) => {
+                            config.last_known_working = Some(working_snapshot(&fallback));
+                            dirty = true;
+                            status = AppStatus::info(
+                                "Recovered the last known working monitor topology because Windows had no available active display",
+                            );
                         }
-                    } else {
-                        status = "Windows has no available active display, but MonMan has not recorded a last known working topology yet".into();
-                        status_is_error = true;
+                        saved_result => match display::restore_connected_topology() {
+                            Ok(()) => {
+                                match display::capture_layout("Last known working topology") {
+                                    Ok(snapshot)
+                                        if snapshot
+                                            .monitors
+                                            .iter()
+                                            .any(|monitor| monitor.enabled) =>
+                                    {
+                                        config.last_known_working =
+                                            Some(sanitized_working_snapshot(snapshot));
+                                        dirty = true;
+                                        status = AppStatus::info(
+                                            "Recovered a working topology for the monitors connected now",
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        status = AppStatus::error(
+                                            "Windows restored the connected-monitor topology, but MonMan could not find an active monitor to record",
+                                        );
+                                    }
+                                    Err(error) => {
+                                        status = AppStatus::error(format!(
+                                            "Windows restored the connected-monitor topology, but MonMan could not record it: {error:#}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(connected_error) => {
+                                status = match saved_result {
+                                    Some(Err(saved_error)) => AppStatus::error(format!(
+                                        "Startup recovery failed: the saved topology is unavailable ({saved_error:#}), and Windows could not activate the monitors connected now ({connected_error:#})"
+                                    )),
+                                    None => AppStatus::error(format!(
+                                        "Startup recovery failed because Windows could not activate the monitors connected now: {connected_error:#}"
+                                    )),
+                                    Some(Ok(_)) => {
+                                        unreachable!("a successful saved recovery is handled above")
+                                    }
+                                };
+                            }
+                        },
                     }
                 }
                 Ok(false) => match display::capture_layout("Last known working topology") {
@@ -77,14 +130,15 @@ impl MonManApp {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        status =
-                            format!("Could not record the current working topology: {error:#}");
-                        status_is_error = true;
+                        status = AppStatus::error(format!(
+                            "Could not record the current working topology: {error:#}"
+                        ));
                     }
                 },
                 Err(error) => {
-                    status = format!("Could not inspect the startup monitor topology: {error:#}");
-                    status_is_error = true;
+                    status = AppStatus::error(format!(
+                        "Could not inspect the startup monitor topology: {error:#}"
+                    ));
                 }
             }
         }
@@ -94,17 +148,21 @@ impl MonManApp {
         let controllers = ControllerManager::new(cc.egui_ctx.clone());
         let tray = match TrayManager::new(cc.egui_ctx.clone()) {
             Ok(tray) => {
-                if !status_is_error {
-                    status = "Ready — closing the window keeps MonMan running in the tray".into();
+                if !status.is_error {
+                    status = AppStatus::info(
+                        "Ready — closing the window keeps MonMan running in the tray",
+                    );
                 }
                 Some(tray)
             }
             Err(error) => {
-                status = format!("System tray is unavailable; closing MonMan will exit: {error:#}");
-                status_is_error = true;
+                status = AppStatus::error(format!(
+                    "System tray is unavailable; closing MonMan will exit: {error:#}"
+                ));
                 None
             }
         };
+        let updater = UpdateManager::new(cc.egui_ctx.clone());
         let mut app = Self {
             config,
             selected,
@@ -114,16 +172,22 @@ impl MonManApp {
             controller_capture_layout: None,
             controller_capture_status: String::new(),
             tray,
+            updater,
+            available_update: None,
+            update_in_progress: false,
             exit_requested: false,
             status,
-            status_is_error,
             dirty,
             last_persist: Instant::now(),
             undo_layout: None,
         };
-        app.refresh_hotkeys();
-        app.refresh_controller_hotkeys();
+        app.refresh_bindings();
         app
+    }
+
+    fn refresh_bindings(&mut self) {
+        self.refresh_hotkeys();
+        self.refresh_controller_hotkeys();
     }
 
     fn refresh_hotkeys(&mut self) {
@@ -141,8 +205,7 @@ impl MonManApp {
             .collect();
 
         if let Err(err) = self.hotkeys.replace(specs) {
-            self.status = format!("Could not update global hotkeys: {err:#}");
-            self.status_is_error = true;
+            self.status = AppStatus::error(format!("Could not update global hotkeys: {err:#}"));
         }
     }
 
@@ -165,8 +228,7 @@ impl MonManApp {
             .collect();
 
         if let Err(err) = self.controllers.replace(specs) {
-            self.status = format!("Could not update controller hotkeys: {err:#}");
-            self.status_is_error = true;
+            self.status = AppStatus::error(format!("Could not update controller hotkeys: {err:#}"));
         }
     }
 
@@ -175,9 +237,7 @@ impl MonManApp {
             return;
         }
 
-        // Avoid rewriting layouts.json on every animation frame while a monitor
-        // is being dragged. Ensure there is a future repaint so the final edit
-        // is still flushed even after input activity stops.
+        // Debounce saves while keeping a repaint scheduled for the final edit.
         const SAVE_INTERVAL: Duration = Duration::from_millis(500);
         let elapsed = self.last_persist.elapsed();
         if elapsed < SAVE_INTERVAL {
@@ -191,8 +251,7 @@ impl MonManApp {
                 self.dirty = false;
             }
             Err(err) => {
-                self.status = format!("Could not save layouts: {err:#}");
-                self.status_is_error = true;
+                self.status = AppStatus::error(format!("Could not save layouts: {err:#}"));
             }
         }
     }
@@ -201,12 +260,10 @@ impl MonManApp {
         match storage::save(&self.config) {
             Ok(()) => {
                 self.dirty = false;
-                self.status = "Layouts saved".into();
-                self.status_is_error = false;
+                self.status = AppStatus::info("Layouts saved");
             }
             Err(err) => {
-                self.status = format!("Could not save layouts: {err:#}");
-                self.status_is_error = true;
+                self.status = AppStatus::error(format!("Could not save layouts: {err:#}"));
             }
         }
     }
@@ -214,16 +271,9 @@ impl MonManApp {
     fn capture_new(&mut self) {
         let name = format!("Layout {}", self.config.layouts.len() + 1);
         match display::capture_layout(name) {
-            Ok(layout) => {
-                self.config.layouts.push(layout);
-                self.selected = Some(self.config.layouts.len() - 1);
-                self.dirty = true;
-                self.status = "Captured current Windows display topology".into();
-                self.status_is_error = false;
-            }
+            Ok(layout) => self.add_layout(layout, "Captured current Windows display topology"),
             Err(err) => {
-                self.status = format!("Capture failed: {err:#}");
-                self.status_is_error = true;
+                self.status = AppStatus::error(format!("Capture failed: {err:#}"));
             }
         }
     }
@@ -234,22 +284,25 @@ impl MonManApp {
             Ok(mut layout) => {
                 for monitor in &mut layout.monitors {
                     monitor.enabled = false;
-                    // A custom layout starts extended/independent. Capturing an
-                    // existing cloned desktop should not silently make future
-                    // selections clone together.
                     monitor.clone_group = None;
                 }
-                self.config.layouts.push(layout);
-                self.selected = Some(self.config.layouts.len() - 1);
-                self.dirty = true;
-                self.status = "Created a custom layout from currently connected monitors".into();
-                self.status_is_error = false;
+                self.add_layout(
+                    layout,
+                    "Created a custom layout from currently connected monitors",
+                );
             }
             Err(err) => {
-                self.status = format!("Could not enumerate connected monitors: {err:#}");
-                self.status_is_error = true;
+                self.status =
+                    AppStatus::error(format!("Could not enumerate connected monitors: {err:#}"));
             }
         }
+    }
+
+    fn add_layout(&mut self, layout: MonitorLayout, status: impl Into<String>) {
+        self.config.layouts.push(layout);
+        self.selected = Some(self.config.layouts.len() - 1);
+        self.dirty = true;
+        self.status = AppStatus::info(status);
     }
 
     fn recapture_selected(&mut self) {
@@ -267,12 +320,11 @@ impl MonManApp {
                 layout.controller_hotkey = old_controller_hotkey;
                 self.config.layouts[index] = layout;
                 self.dirty = true;
-                self.status = "Replaced this layout with the current desktop topology".into();
-                self.status_is_error = false;
+                self.status =
+                    AppStatus::info("Replaced this layout with the current desktop topology");
             }
             Err(err) => {
-                self.status = format!("Capture failed: {err:#}");
-                self.status_is_error = true;
+                self.status = AppStatus::error(format!("Capture failed: {err:#}"));
             }
         }
     }
@@ -295,29 +347,9 @@ impl MonManApp {
                         .iter_mut()
                         .find(|saved| saved.identity.matches(&current_monitor.identity))
                     {
-                        existing.friendly_name = current_monitor.friendly_name;
-                        if existing.identity.device_path.is_empty()
-                            && !current_monitor.identity.device_path.is_empty()
-                        {
-                            existing.identity = current_monitor.identity;
-                        }
-                        if existing.rotation.is_none() {
-                            existing.rotation = current_monitor.rotation;
-                        }
-                        if existing.scaling.is_none() {
-                            existing.scaling = current_monitor.scaling;
-                        }
-                        if existing.refresh_numerator.is_none()
-                            && existing.refresh_denominator.is_none()
-                            && (existing.refresh_hz - current_monitor.refresh_hz).abs() < 0.01
-                        {
-                            existing.refresh_numerator = current_monitor.refresh_numerator;
-                            existing.refresh_denominator = current_monitor.refresh_denominator;
-                        }
+                        refresh_monitor(existing, current_monitor);
                         refreshed += 1;
                     } else {
-                        // Syncing should never silently change the meaning of a saved
-                        // layout. Newly discovered monitors start disabled.
                         current_monitor.enabled = false;
                         current_monitor.clone_group = None;
                         layout.monitors.push(current_monitor);
@@ -329,12 +361,12 @@ impl MonManApp {
                     .monitors
                     .sort_by_key(|m| (m.x, m.y, m.friendly_name.clone()));
                 self.dirty |= added > 0 || refreshed > 0;
-                self.status = format!("Monitor list refreshed: {added} added, {refreshed} matched");
-                self.status_is_error = false;
+                self.status = AppStatus::info(format!(
+                    "Monitor list refreshed: {added} added, {refreshed} matched"
+                ));
             }
             Err(err) => {
-                self.status = format!("Could not refresh monitors: {err:#}");
-                self.status_is_error = true;
+                self.status = AppStatus::error(format!("Could not refresh monitors: {err:#}"));
             }
         }
     }
@@ -352,10 +384,20 @@ impl MonManApp {
         self.config.layouts.insert(index + 1, copy);
         self.selected = Some(index + 1);
         self.dirty = true;
-        self.status = "Duplicated layout (hotkeys cleared on the copy)".into();
-        self.status_is_error = false;
-        self.refresh_hotkeys();
-        self.refresh_controller_hotkeys();
+        self.status = AppStatus::info("Duplicated layout (hotkeys cleared on the copy)");
+        self.refresh_bindings();
+    }
+
+    fn delete_layout(&mut self, index: usize) {
+        if self.controller_capture_layout.is_some() {
+            self.cancel_controller_capture();
+        }
+        self.config.layouts.remove(index);
+        self.selected =
+            (!self.config.layouts.is_empty()).then(|| index.min(self.config.layouts.len() - 1));
+        self.dirty = true;
+        self.refresh_bindings();
+        self.status = AppStatus::info("Deleted layout");
     }
 
     fn apply_index(&mut self, index: usize) {
@@ -363,16 +405,13 @@ impl MonManApp {
             return;
         }
 
-        // Capture a known-good topology before touching active paths. SetDisplayConfig
-        // is intentionally applied in two stages, so a failure during the mode stage
-        // can happen after the topology stage has already changed the desktop.
+        // Applying is staged, so capture a rollback point before changing topology.
         let previous = match display::capture_layout("Previous topology") {
             Ok(layout) => layout,
             Err(err) => {
-                self.status = format!(
+                self.status = AppStatus::error(format!(
                     "Apply cancelled because the current topology could not be captured for rollback: {err:#}"
-                );
-                self.status_is_error = true;
+                ));
                 return;
             }
         };
@@ -383,22 +422,19 @@ impl MonManApp {
             Ok(()) => {
                 self.undo_layout = Some(previous);
                 self.remember_working_layout(&layout);
-                self.status = format!("Applied '{name}'");
-                self.status_is_error = false;
+                self.status = AppStatus::info(format!("Applied '{name}'"));
             }
             Err(apply_err) => match display::apply_layout(&previous) {
                 Ok(()) => {
                     self.remember_working_layout(&previous);
-                    self.status = format!(
+                    self.status = AppStatus::error(format!(
                         "Could not apply '{name}': {apply_err:#}. The previous topology was restored."
-                    );
-                    self.status_is_error = true;
+                    ));
                 }
                 Err(rollback_err) => {
-                    self.status = format!(
+                    self.status = AppStatus::error(format!(
                         "Could not apply '{name}': {apply_err:#}. Automatic rollback also failed: {rollback_err:#}"
-                    );
-                    self.status_is_error = true;
+                    ));
                 }
             },
         }
@@ -413,12 +449,12 @@ impl MonManApp {
             Ok(()) => {
                 self.remember_working_layout(&previous);
                 self.undo_layout = None;
-                self.status = "Restored the topology from before the last successful apply".into();
-                self.status_is_error = false;
+                self.status =
+                    AppStatus::info("Restored the topology from before the last successful apply");
             }
             Err(err) => {
-                self.status = format!("Could not restore the previous topology: {err:#}");
-                self.status_is_error = true;
+                self.status =
+                    AppStatus::error(format!("Could not restore the previous topology: {err:#}"));
             }
         }
     }
@@ -431,10 +467,10 @@ impl MonManApp {
                     if failures.is_empty() {
                         if self
                             .status
+                            .message
                             .starts_with("Some global hotkeys could not be registered:")
                         {
-                            self.status = "Global hotkeys updated".into();
-                            self.status_is_error = false;
+                            self.status = AppStatus::info("Global hotkeys updated");
                         }
                         continue;
                     }
@@ -457,8 +493,9 @@ impl MonManApp {
                         })
                         .collect::<Vec<_>>()
                         .join("; ");
-                    self.status = format!("Some global hotkeys could not be registered: {details}");
-                    self.status_is_error = true;
+                    self.status = AppStatus::error(format!(
+                        "Some global hotkeys could not be registered: {details}"
+                    ));
                 }
             }
         }
@@ -472,34 +509,28 @@ impl MonManApp {
                     layout_index,
                     binding,
                 } => {
-                    self.controller_capture_layout = None;
-                    self.controller_capture_status.clear();
+                    self.clear_controller_capture();
                     if let Some(layout) = self.config.layouts.get_mut(layout_index) {
                         let label = binding.label();
                         layout.controller_hotkey = Some(binding);
                         self.dirty = true;
                         self.refresh_controller_hotkeys();
-                        self.status = format!("Controller hotkey saved: {label}");
-                        self.status_is_error = false;
+                        self.status = AppStatus::info(format!("Controller hotkey saved: {label}"));
                     }
                 }
                 ControllerEvent::CaptureProgress(message) => {
                     self.controller_capture_status = message;
                 }
                 ControllerEvent::CaptureCancelled(message) => {
-                    self.controller_capture_layout = None;
-                    self.controller_capture_status.clear();
-                    self.status = message;
-                    self.status_is_error = false;
+                    self.clear_controller_capture();
+                    self.status = AppStatus::info(message);
                 }
                 ControllerEvent::DevicesChanged(devices) => {
                     self.controller_devices = devices;
                 }
                 ControllerEvent::Error(error) => {
-                    self.controller_capture_layout = None;
-                    self.controller_capture_status.clear();
-                    self.status = error;
-                    self.status_is_error = true;
+                    self.clear_controller_capture();
+                    self.status = AppStatus::error(error);
                 }
             }
         }
@@ -511,21 +542,24 @@ impl MonManApp {
                 self.controller_capture_layout = Some(layout_index);
                 self.controller_capture_status =
                     "Release all controller buttons, then press the desired chord".into();
-                self.status = "Listening for a controller hotkey".into();
-                self.status_is_error = false;
+                self.status = AppStatus::info("Listening for a controller hotkey");
             }
             Err(error) => {
-                self.status = format!("Could not start controller binding: {error:#}");
-                self.status_is_error = true;
+                self.status =
+                    AppStatus::error(format!("Could not start controller binding: {error:#}"));
             }
         }
     }
 
     fn cancel_controller_capture(&mut self) {
         if let Err(error) = self.controllers.cancel_capture() {
-            self.status = format!("Could not cancel controller binding: {error:#}");
-            self.status_is_error = true;
+            self.status =
+                AppStatus::error(format!("Could not cancel controller binding: {error:#}"));
         }
+        self.clear_controller_capture();
+    }
+
+    fn clear_controller_capture(&mut self) {
         self.controller_capture_layout = None;
         self.controller_capture_status.clear();
     }
@@ -546,8 +580,7 @@ impl MonManApp {
                 }
                 TrayEvent::ExitRequested => self.request_exit(ctx),
                 TrayEvent::Error(error) => {
-                    self.status = format!("System tray stopped working: {error}");
-                    self.status_is_error = true;
+                    self.status = AppStatus::error(format!("System tray stopped working: {error}"));
                     tray_failed = true;
                 }
             }
@@ -557,11 +590,36 @@ impl MonManApp {
         }
     }
 
+    fn handle_updater(&mut self, ctx: &egui::Context) {
+        while let Some(event) = self.updater.try_recv() {
+            match event {
+                UpdateEvent::Available(update) => {
+                    if !self.status.is_error {
+                        self.status =
+                            AppStatus::info(format!("Update {} is available", update.tag));
+                    }
+                    self.available_update = Some(update);
+                }
+                UpdateEvent::InstallerLaunched => {
+                    self.status = AppStatus::info(
+                        "Update verified and installer launched; MonMan will restart",
+                    );
+                    self.request_exit(ctx);
+                }
+                UpdateEvent::InstallFailed(error) => {
+                    self.update_in_progress = false;
+                    self.status = AppStatus::error(format!("Update failed: {error}"));
+                }
+            }
+        }
+    }
+
     fn hide_to_tray(&mut self, ctx: &egui::Context) {
         if self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.status = "MonMan is running in the system tray; keyboard and controller hotkeys remain active".into();
-            self.status_is_error = false;
+            self.status = AppStatus::info(
+                "MonMan is running in the system tray; keyboard and controller hotkeys remain active",
+            );
         }
     }
 
@@ -635,6 +693,28 @@ impl MonManApp {
                     {
                         self.undo_last_apply();
                     }
+                    ui.separator();
+                    ui.small(format!("MonMan v{}", env!("CARGO_PKG_VERSION")));
+                    if let Some(update) = self.available_update.clone()
+                        && ui
+                            .add_enabled(
+                                !self.update_in_progress,
+                                egui::Button::new(if self.update_in_progress {
+                                    format!("Installing {}…", update.tag)
+                                } else {
+                                    format!("Update to {}", update.tag)
+                                }),
+                            )
+                            .on_hover_text(
+                                "Download the GitHub release asset, verify its SHA-256 digest, install it, and restart MonMan",
+                            )
+                            .clicked()
+                    {
+                        self.update_in_progress = true;
+                        self.status =
+                            AppStatus::info(format!("Downloading update {}…", update.tag));
+                        self.updater.install(update);
+                    }
                 });
             });
     }
@@ -655,17 +735,6 @@ impl MonManApp {
                 return;
             }
 
-            let mut delete = false;
-            let mut apply = false;
-            let mut recapture = false;
-            let mut sync_monitors = false;
-            let mut duplicate = false;
-            let mut hotkeys_changed = false;
-            let mut controller_binding_changed = false;
-            let mut begin_controller_capture = false;
-            let mut cancel_controller_capture = false;
-            let mut make_primary = None::<usize>;
-            let mut clone_geometry_update = None::<(usize, Option<u32>, i32, i32, u32, u32)>;
             let capture_active = self.controller_capture_layout == Some(index);
             let capture_elsewhere = self.controller_capture_layout.is_some() && !capture_active;
             let capture_status = self.controller_capture_status.clone();
@@ -675,366 +744,73 @@ impl MonManApp {
                 .map(ControllerDeviceInfo::label)
                 .collect::<Vec<_>>();
 
-            {
+            let (layout_action, hotkeys_changed, controller_edit, layout_changed) = {
                 let layout = &mut self.config.layouts[index];
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Name");
-                    if ui.text_edit_singleline(&mut layout.name).changed() {
-                        self.dirty = true;
-                    }
-                    if ui.button("Apply").clicked() {
-                        apply = true;
-                    }
-                    if ui.button("Capture current into this").clicked() {
-                        recapture = true;
-                    }
-                    if ui.button("Sync connected monitors").clicked() {
-                        sync_monitors = true;
-                    }
-                    if ui.button("Duplicate").clicked() {
-                        duplicate = true;
-                    }
-                    if ui.button("Delete").clicked() {
-                        delete = true;
-                    }
-                });
+                let (name_changed, layout_action) = layout_toolbar(ui, layout);
 
                 ui.add_space(10.0);
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("Global hotkey");
-                        let mut enabled = layout.hotkey.is_some();
-                        if ui.checkbox(&mut enabled, "Enabled").changed() {
-                            layout.hotkey = enabled.then_some(HotkeyBinding::default());
-                            self.dirty = true;
-                            hotkeys_changed = true;
-                        }
-                    });
-
-                    if let Some(binding) = layout.hotkey.as_mut() {
-                        ui.horizontal_wrapped(|ui| {
-                            hotkeys_changed |= ui.checkbox(&mut binding.ctrl, "Ctrl").changed();
-                            hotkeys_changed |= ui.checkbox(&mut binding.alt, "Alt").changed();
-                            hotkeys_changed |= ui.checkbox(&mut binding.shift, "Shift").changed();
-                            hotkeys_changed |= ui.checkbox(&mut binding.win, "Win").changed();
-
-                            egui::ComboBox::from_id_salt(("hotkey_key", index))
-                                .selected_text(binding.key.label())
-                                .show_ui(ui, |ui| {
-                                    for key in HotkeyKey::ALL {
-                                        hotkeys_changed |= ui
-                                            .selectable_value(&mut binding.key, key, key.label())
-                                            .changed();
-                                    }
-                                });
-
-                            ui.label(format!("→ {}", binding.label()));
-                        });
-                        if !binding.has_modifier() {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                "Choose at least one modifier for a global hotkey.",
-                            );
-                        }
-                        if hotkeys_changed {
-                            self.dirty = true;
-                        }
-                    }
-                });
+                let hotkeys_changed = global_hotkey_editor(ui, layout, index);
 
                 ui.add_space(8.0);
-                ui.group(|ui| {
-                    ui.strong("Controller hotkey");
-                    let binding_label = layout
-                        .controller_hotkey
-                        .as_ref()
-                        .map(|binding| binding.label());
-
-                    if let Some(label) = binding_label {
-                        ui.label(label);
-                    } else {
-                        ui.label("No controller chord assigned to this layout.");
-                    }
-
-                    ui.horizontal_wrapped(|ui| {
-                        if capture_active {
-                            ui.spinner();
-                            if ui.button("Cancel listening").clicked() {
-                                cancel_controller_capture = true;
-                            }
-                        } else {
-                            let text = if layout.controller_hotkey.is_some() {
-                                "Rebind controller chord"
-                            } else {
-                                "Bind controller chord"
-                            };
-                            if ui
-                                .add_enabled(!capture_elsewhere, egui::Button::new(text))
-                                .on_hover_text(
-                                    "Release all buttons, press one button or a chord, then release it to save",
-                                )
-                                .clicked()
-                            {
-                                begin_controller_capture = true;
-                            }
-                            if ui
-                                .add_enabled(
-                                    layout.controller_hotkey.is_some(),
-                                    egui::Button::new("Clear"),
-                                )
-                                .clicked()
-                            {
-                                layout.controller_hotkey = None;
-                                controller_binding_changed = true;
-                                self.dirty = true;
-                            }
-                        }
-                    });
-
-                    if capture_active {
-                        ui.colored_label(ui.visuals().warn_fg_color, capture_status);
-                    } else if capture_elsewhere {
-                        ui.small("Controller listening is active for another layout.");
-                    }
-
-                    if connected_controllers.is_empty() {
-                        ui.small("No Windows game controller is currently connected.");
-                    } else {
-                        ui.small(format!(
-                            "Connected: {}",
-                            connected_controllers.join(", ")
-                        ));
-                    }
-                    ui.small(
-                        "Controller hotkeys keep working while MonMan is hidden in the system tray.",
-                    );
-                });
-
-                ui.add_space(10.0);
-                let enabled_count = layout.monitors.iter().filter(|m| m.enabled).count();
-                ui.horizontal(|ui| {
-                    ui.heading("Monitor layout");
-                    ui.label(format!(
-                        "{} enabled / {} known",
-                        enabled_count,
-                        layout.monitors.len()
-                    ));
-                });
-                ui.label(
-                    "Drag monitors in the preview to edit their desktop coordinates. Enabled monitors snap to adjacent edges and matching top, middle, or bottom axes; the active snap is highlighted.",
+                let controller_edit = controller_hotkey_editor(
+                    ui,
+                    layout,
+                    capture_active,
+                    capture_elsewhere,
+                    &capture_status,
+                    &connected_controllers,
                 );
+                let monitor_changed = monitor_editor(ui, layout, index);
+                let layout_changed = name_changed
+                    || hotkeys_changed
+                    || monitor_changed
+                    || controller_edit == Some(ControllerEdit::Clear);
 
-                if enabled_count == 0 {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        "This layout cannot be applied until at least one monitor is enabled.",
-                    );
-                }
+                (
+                    layout_action,
+                    hotkeys_changed,
+                    controller_edit,
+                    layout_changed,
+                )
+            };
 
-                self.dirty |= monitor_layout_canvas(ui, layout, index);
-
-                ui.add_space(8.0);
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new(("monitor_grid", index))
-                            .striped(true)
-                            .num_columns(11)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                                ui.strong("On");
-                                ui.strong("Monitor");
-                                ui.strong("X");
-                                ui.strong("Y");
-                                ui.strong("Width");
-                                ui.strong("Height");
-                                ui.strong("Orientation");
-                                ui.strong("Hz");
-                                ui.strong("Primary");
-                                ui.strong("Clone");
-                                ui.strong("Identity");
-                                ui.end_row();
-
-                                for (monitor_index, monitor) in
-                                    layout.monitors.iter_mut().enumerate()
-                                {
-                                    if ui.checkbox(&mut monitor.enabled, "").changed() {
-                                        self.dirty = true;
-                                    }
-                                    ui.label(&monitor.friendly_name);
-                                    let mut geometry_changed = false;
-                                    geometry_changed |= ui
-                                        .add(egui::DragValue::new(&mut monitor.x).speed(10))
-                                        .changed();
-                                    geometry_changed |= ui
-                                        .add(egui::DragValue::new(&mut monitor.y).speed(10))
-                                        .changed();
-                                    geometry_changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut monitor.width)
-                                                .range(320..=16384)
-                                                .speed(10),
-                                        )
-                                        .changed();
-                                    geometry_changed |= ui
-                                        .add(
-                                            egui::DragValue::new(&mut monitor.height)
-                                                .range(200..=16384)
-                                                .speed(10),
-                                        )
-                                        .changed();
-                                    let old_rotation = monitor.rotation.unwrap_or(0);
-                                    let mut rotation = old_rotation;
-                                    egui::ComboBox::from_id_salt((
-                                        "monitor_rotation",
-                                        index,
-                                        monitor_index,
-                                    ))
-                                    .selected_text(rotation_label(rotation))
-                                    .show_ui(ui, |ui| {
-                                        for (value, label) in DISPLAY_ROTATIONS {
-                                            ui.selectable_value(&mut rotation, value, label);
-                                        }
-                                    });
-                                    if rotation != old_rotation {
-                                        monitor.rotation = Some(rotation);
-                                        self.dirty = true;
-                                    }
-                                    if geometry_changed {
-                                        self.dirty = true;
-                                        clone_geometry_update = Some((
-                                            monitor_index,
-                                            monitor.clone_group,
-                                            monitor.x,
-                                            monitor.y,
-                                            monitor.width,
-                                            monitor.height,
-                                        ));
-                                    }
-                                    let refresh_changed = ui
-                                        .add(
-                                            egui::DragValue::new(&mut monitor.refresh_hz)
-                                                .range(1.0..=1000.0)
-                                                .speed(1.0)
-                                                .suffix(" Hz"),
-                                        )
-                                        .changed();
-                                    if refresh_changed {
-                                        monitor.refresh_numerator = None;
-                                        monitor.refresh_denominator = None;
-                                        self.dirty = true;
-                                    }
-
-                                    if monitor.enabled && monitor.x == 0 && monitor.y == 0 {
-                                        ui.strong("Primary");
-                                    } else if ui
-                                        .add_enabled(monitor.enabled, egui::Button::new("Make primary"))
-                                        .clicked()
-                                    {
-                                        make_primary = Some(monitor_index);
-                                    }
-
-                                    ui.label(
-                                        monitor
-                                            .clone_group
-                                            .map(|group| format!("#{group}"))
-                                            .unwrap_or_else(|| "—".to_string()),
-                                    );
-
-                                    ui.label(
-                                        egui::RichText::new(monitor.identity.display_label())
-                                            .small(),
-                                    )
-                                    .on_hover_text(&monitor.identity.device_path);
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                if let Some((source_index, Some(group), x, y, width, height)) =
-                    clone_geometry_update
-                {
-                    for (monitor_index, monitor) in layout.monitors.iter_mut().enumerate() {
-                        if monitor_index != source_index && monitor.clone_group == Some(group) {
-                            monitor.x = x;
-                            monitor.y = y;
-                            monitor.width = width;
-                            monitor.height = height;
-                        }
-                    }
-                }
-
-                if let Some(primary_index) = make_primary
-                    && let Some(primary) = layout.monitors.get(primary_index)
-                {
-                    let offset_x = primary.x;
-                    let offset_y = primary.y;
-                    for monitor in &mut layout.monitors {
-                        monitor.x = monitor.x.saturating_sub(offset_x);
-                        monitor.y = monitor.y.saturating_sub(offset_y);
-                    }
-                    self.dirty = true;
-                }
-            }
-
+            self.dirty |= layout_changed;
             if hotkeys_changed {
                 self.refresh_hotkeys();
             }
-            if controller_binding_changed {
-                self.refresh_controller_hotkeys();
-                self.status = "Controller hotkey cleared".into();
-                self.status_is_error = false;
-            }
-            if cancel_controller_capture {
-                self.cancel_controller_capture();
-            }
-            if begin_controller_capture {
-                self.begin_controller_capture(index);
-            }
-
-            if delete {
-                if self.controller_capture_layout.is_some() {
-                    self.cancel_controller_capture();
+            match controller_edit {
+                Some(ControllerEdit::Clear) => {
+                    self.refresh_controller_hotkeys();
+                    self.status = AppStatus::info("Controller hotkey cleared");
                 }
-                self.config.layouts.remove(index);
-                self.selected = if self.config.layouts.is_empty() {
-                    None
-                } else {
-                    Some(index.min(self.config.layouts.len() - 1))
-                };
-                self.dirty = true;
-                self.refresh_hotkeys();
-                self.refresh_controller_hotkeys();
-                self.status = "Deleted layout".into();
-                self.status_is_error = false;
-                return;
+                Some(ControllerEdit::CancelCapture) => self.cancel_controller_capture(),
+                Some(ControllerEdit::BeginCapture) => self.begin_controller_capture(index),
+                None => {}
             }
 
-            if duplicate {
-                self.duplicate_selected();
-                return;
-            }
-            if recapture {
-                self.recapture_selected();
-            }
-            if sync_monitors {
-                self.merge_connected_monitors();
-            }
-            if apply {
-                self.apply_index(index);
+            match layout_action {
+                Some(LayoutAction::Delete) => {
+                    self.delete_layout(index);
+                }
+                Some(LayoutAction::Duplicate) => {
+                    self.duplicate_selected();
+                }
+                Some(LayoutAction::Recapture) => self.recapture_selected(),
+                Some(LayoutAction::SyncMonitors) => self.merge_connected_monitors(),
+                Some(LayoutAction::Apply) => self.apply_index(index),
+                None => {}
             }
         });
     }
-
     fn status_bar(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar").show_inside(root_ui, |ui| {
             ui.horizontal(|ui| {
-                let color = if self.status_is_error {
+                let color = if self.status.is_error {
                     ui.visuals().error_fg_color
                 } else {
                     ui.visuals().text_color()
                 };
-                ui.colored_label(color, &self.status);
+                ui.colored_label(color, &self.status.message);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(format!(
@@ -1049,13 +825,337 @@ impl MonManApp {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LayoutAction {
+    Apply,
+    Recapture,
+    SyncMonitors,
+    Duplicate,
+    Delete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControllerEdit {
+    BeginCapture,
+    CancelCapture,
+    Clear,
+}
+
+fn layout_toolbar(ui: &mut egui::Ui, layout: &mut MonitorLayout) -> (bool, Option<LayoutAction>) {
+    let mut action = None;
+    let name_changed = ui
+        .horizontal_wrapped(|ui| {
+            ui.label("Name");
+            let changed = ui.text_edit_singleline(&mut layout.name).changed();
+            for (label, candidate) in [
+                ("Apply", LayoutAction::Apply),
+                ("Capture current into this", LayoutAction::Recapture),
+                ("Sync connected monitors", LayoutAction::SyncMonitors),
+                ("Duplicate", LayoutAction::Duplicate),
+                ("Delete", LayoutAction::Delete),
+            ] {
+                if ui.button(label).clicked() {
+                    action = Some(candidate);
+                }
+            }
+            changed
+        })
+        .inner;
+    (name_changed, action)
+}
+
+fn global_hotkey_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -> bool {
+    let mut changed = false;
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.strong("Global hotkey");
+            let mut enabled = layout.hotkey.is_some();
+            if ui.checkbox(&mut enabled, "Enabled").changed() {
+                layout.hotkey = enabled.then_some(HotkeyBinding::default());
+                changed = true;
+            }
+        });
+
+        let Some(binding) = layout.hotkey.as_mut() else {
+            return;
+        };
+        ui.horizontal_wrapped(|ui| {
+            changed |= ui.checkbox(&mut binding.ctrl, "Ctrl").changed();
+            changed |= ui.checkbox(&mut binding.alt, "Alt").changed();
+            changed |= ui.checkbox(&mut binding.shift, "Shift").changed();
+            changed |= ui.checkbox(&mut binding.win, "Win").changed();
+
+            egui::ComboBox::from_id_salt(("hotkey_key", index))
+                .selected_text(binding.key.label())
+                .show_ui(ui, |ui| {
+                    for key in HotkeyKey::ALL {
+                        changed |= ui
+                            .selectable_value(&mut binding.key, key, key.label())
+                            .changed();
+                    }
+                });
+            ui.label(format!("→ {}", binding.label()));
+        });
+        if !binding.has_modifier() {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "Choose at least one modifier for a global hotkey.",
+            );
+        }
+    });
+    changed
+}
+
+fn controller_hotkey_editor(
+    ui: &mut egui::Ui,
+    layout: &mut MonitorLayout,
+    capture_active: bool,
+    capture_elsewhere: bool,
+    capture_status: &str,
+    connected_controllers: &[String],
+) -> Option<ControllerEdit> {
+    let mut action = None;
+    ui.group(|ui| {
+        ui.strong("Controller hotkey");
+        match layout.controller_hotkey.as_ref() {
+            Some(binding) => ui.label(binding.label()),
+            None => ui.label("No controller chord assigned to this layout."),
+        };
+
+        ui.horizontal_wrapped(|ui| {
+            if capture_active {
+                ui.spinner();
+                if ui.button("Cancel listening").clicked() {
+                    action = Some(ControllerEdit::CancelCapture);
+                }
+                return;
+            }
+
+            let text = if layout.controller_hotkey.is_some() {
+                "Rebind controller chord"
+            } else {
+                "Bind controller chord"
+            };
+            if ui
+                .add_enabled(!capture_elsewhere, egui::Button::new(text))
+                .on_hover_text(
+                    "Release all buttons, press one button or a chord, then release it to save",
+                )
+                .clicked()
+            {
+                action = Some(ControllerEdit::BeginCapture);
+            }
+            if ui
+                .add_enabled(
+                    layout.controller_hotkey.is_some(),
+                    egui::Button::new("Clear"),
+                )
+                .clicked()
+            {
+                layout.controller_hotkey = None;
+                action = Some(ControllerEdit::Clear);
+            }
+        });
+
+        if capture_active {
+            ui.colored_label(ui.visuals().warn_fg_color, capture_status);
+        } else if capture_elsewhere {
+            ui.small("Controller listening is active for another layout.");
+        }
+
+        if connected_controllers.is_empty() {
+            ui.small("No Windows game controller is currently connected.");
+        } else {
+            ui.small(format!("Connected: {}", connected_controllers.join(", ")));
+        }
+        ui.small("Controller hotkeys keep working while MonMan is hidden in the system tray.");
+    });
+    action
+}
+
+struct GeometryUpdate {
+    source_index: usize,
+    clone_group: Option<u32>,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn monitor_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -> bool {
+    let mut changed = false;
+    ui.add_space(10.0);
+    let enabled_count = layout
+        .monitors
+        .iter()
+        .filter(|monitor| monitor.enabled)
+        .count();
+    ui.horizontal(|ui| {
+        ui.heading("Monitor layout");
+        ui.label(format!(
+            "{} enabled / {} known",
+            enabled_count,
+            layout.monitors.len()
+        ));
+    });
+    ui.label(
+        "Drag monitors in the preview to edit their desktop coordinates. Enabled monitors snap to adjacent edges and matching top, middle, or bottom axes; the active snap is highlighted.",
+    );
+    if enabled_count == 0 {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            "This layout cannot be applied until at least one monitor is enabled.",
+        );
+    }
+
+    changed |= monitor_layout_canvas(ui, layout, index);
+
+    let mut make_primary = None;
+    let mut geometry_update = None;
+    ui.add_space(8.0);
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            egui::Grid::new(("monitor_grid", index))
+                .striped(true)
+                .num_columns(11)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    for heading in [
+                        "On",
+                        "Monitor",
+                        "X",
+                        "Y",
+                        "Width",
+                        "Height",
+                        "Orientation",
+                        "Hz",
+                        "Primary",
+                        "Clone",
+                        "Identity",
+                    ] {
+                        ui.strong(heading);
+                    }
+                    ui.end_row();
+
+                    for (monitor_index, monitor) in layout.monitors.iter_mut().enumerate() {
+                        changed |= ui.checkbox(&mut monitor.enabled, "").changed();
+                        ui.label(&monitor.friendly_name);
+
+                        let mut geometry_changed = false;
+                        geometry_changed |= ui
+                            .add(egui::DragValue::new(&mut monitor.x).speed(10))
+                            .changed();
+                        geometry_changed |= ui
+                            .add(egui::DragValue::new(&mut monitor.y).speed(10))
+                            .changed();
+                        geometry_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut monitor.width)
+                                    .range(320..=16384)
+                                    .speed(10),
+                            )
+                            .changed();
+                        geometry_changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut monitor.height)
+                                    .range(200..=16384)
+                                    .speed(10),
+                            )
+                            .changed();
+
+                        let old_rotation = monitor.rotation.unwrap_or(0);
+                        let mut rotation = old_rotation;
+                        egui::ComboBox::from_id_salt(("monitor_rotation", index, monitor_index))
+                            .selected_text(rotation_label(rotation))
+                            .show_ui(ui, |ui| {
+                                for (value, label) in DISPLAY_ROTATIONS {
+                                    ui.selectable_value(&mut rotation, value, label);
+                                }
+                            });
+                        if rotation != old_rotation {
+                            monitor.rotation = Some(rotation);
+                            changed = true;
+                        }
+                        if geometry_changed {
+                            changed = true;
+                            geometry_update = Some(GeometryUpdate {
+                                source_index: monitor_index,
+                                clone_group: monitor.clone_group,
+                                x: monitor.x,
+                                y: monitor.y,
+                                width: monitor.width,
+                                height: monitor.height,
+                            });
+                        }
+
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut monitor.refresh_hz)
+                                    .range(1.0..=1000.0)
+                                    .speed(1.0)
+                                    .suffix(" Hz"),
+                            )
+                            .changed()
+                        {
+                            monitor.refresh_numerator = None;
+                            monitor.refresh_denominator = None;
+                            changed = true;
+                        }
+
+                        if monitor.enabled && monitor.x == 0 && monitor.y == 0 {
+                            ui.strong("Primary");
+                        } else if ui
+                            .add_enabled(monitor.enabled, egui::Button::new("Make primary"))
+                            .clicked()
+                        {
+                            make_primary = Some(monitor_index);
+                        }
+
+                        ui.label(
+                            monitor
+                                .clone_group
+                                .map(|group| format!("#{group}"))
+                                .unwrap_or_else(|| "—".to_string()),
+                        );
+                        ui.label(egui::RichText::new(monitor.identity.display_label()).small())
+                            .on_hover_text(&monitor.identity.device_path);
+                        ui.end_row();
+                    }
+                });
+        });
+
+    if let Some(update) = geometry_update
+        && let Some(group) = update.clone_group
+    {
+        for (monitor_index, monitor) in layout.monitors.iter_mut().enumerate() {
+            if monitor_index != update.source_index && monitor.clone_group == Some(group) {
+                monitor.x = update.x;
+                monitor.y = update.y;
+                monitor.width = update.width;
+                monitor.height = update.height;
+            }
+        }
+    }
+
+    if let Some(primary) = make_primary.and_then(|index| layout.monitors.get(index)) {
+        let (offset_x, offset_y) = (primary.x, primary.y);
+        for monitor in &mut layout.monitors {
+            monitor.x = monitor.x.saturating_sub(offset_x);
+            monitor.y = monitor.y.saturating_sub(offset_y);
+        }
+        changed = true;
+    }
+
+    changed
+}
+
 impl eframe::App for MonManApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // eframe still runs logic after a repaint request while the native window
-        // is hidden. Hotkeys therefore remain usable when MonMan is minimized.
         self.handle_hotkeys();
         self.handle_controllers();
         self.handle_tray(ctx);
+        self.handle_updater(ctx);
         self.persist(ctx);
 
         if ctx.input(|input| input.viewport().close_requested()) && !self.exit_requested {
@@ -1063,7 +1163,6 @@ impl eframe::App for MonManApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.hide_to_tray(ctx);
             } else {
-                // Without a working tray there would be no way to reopen the app.
                 self.exit_requested = true;
             }
         }
@@ -1076,8 +1175,6 @@ impl eframe::App for MonManApp {
     }
 
     fn on_exit(&mut self) {
-        // Edits are normally autosaved after a short debounce, but a user can close
-        // the window inside that interval.
         if self.dirty {
             let _ = storage::save(&self.config);
         }
@@ -1088,6 +1185,22 @@ fn working_snapshot(fallback: &MonitorLayout) -> MonitorLayout {
     display::capture_layout("Last known working topology")
         .map(sanitized_working_snapshot)
         .unwrap_or_else(|_| sanitized_working_snapshot(fallback.clone()))
+}
+
+fn refresh_monitor(existing: &mut MonitorConfig, current: MonitorConfig) {
+    existing.friendly_name = current.friendly_name;
+    if existing.identity.device_path.is_empty() && !current.identity.device_path.is_empty() {
+        existing.identity = current.identity;
+    }
+    existing.rotation = existing.rotation.or(current.rotation);
+    existing.scaling = existing.scaling.or(current.scaling);
+
+    let has_exact_refresh =
+        existing.refresh_numerator.is_some() || existing.refresh_denominator.is_some();
+    if !has_exact_refresh && (existing.refresh_hz - current.refresh_hz).abs() < 0.01 {
+        existing.refresh_numerator = current.refresh_numerator;
+        existing.refresh_denominator = current.refresh_denominator;
+    }
 }
 
 fn sanitized_working_snapshot(mut layout: MonitorLayout) -> MonitorLayout {
@@ -1163,7 +1276,7 @@ fn monitor_layout_canvas(
         )
     };
 
-    // Desktop origin. A source positioned at (0, 0) is the primary desktop source.
+    // Desktop origin marks the primary source.
     let origin = to_screen(0.0, 0.0);
     let origin_stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
     if canvas.left() <= origin.x && origin.x <= canvas.right() {

@@ -10,6 +10,7 @@ mod hotkeys;
 mod model;
 mod storage;
 mod tray;
+mod updater;
 
 use app::MonManApp;
 

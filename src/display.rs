@@ -4,21 +4,31 @@ use anyhow::{Context, Result, bail};
 #[cfg(not(windows))]
 pub fn capture_layout(name: impl Into<String>) -> Result<MonitorLayout> {
     let _ = name;
-    bail!("MonMan display control is only available on Windows")
+    unsupported()
 }
 
 #[cfg(not(windows))]
 pub fn apply_layout(_layout: &MonitorLayout) -> Result<()> {
-    bail!("MonMan display control is only available on Windows")
+    unsupported()
 }
 
 #[cfg(not(windows))]
 pub fn startup_topology_needs_recovery() -> Result<bool> {
-    bail!("MonMan display control is only available on Windows")
+    unsupported()
 }
 
 #[cfg(not(windows))]
 pub fn ensure_layout_available(_layout: &MonitorLayout) -> Result<()> {
+    unsupported()
+}
+
+#[cfg(not(windows))]
+pub fn restore_connected_topology() -> Result<()> {
+    unsupported()
+}
+
+#[cfg(not(windows))]
+fn unsupported<T>() -> Result<T> {
     bail!("MonMan display control is only available on Windows")
 }
 
@@ -70,13 +80,12 @@ mod win {
                 Err(_) => continue,
             };
 
-            let dedupe_key = meta.identity.stable_key();
-
-            if !seen.insert(dedupe_key) {
+            let identity_key = meta.identity.stable_key();
+            if !seen.insert(identity_key.clone()) {
                 continue;
             }
 
-            let active_path = active_by_identity.get(&meta.identity.stable_key()).copied();
+            let active_path = active_by_identity.get(&identity_key).copied();
             let enabled = active_path.is_some();
             let selected_path = active_path.unwrap_or(path);
             let rotation = valid_rotation(selected_path.targetInfo.rotation.0);
@@ -124,28 +133,15 @@ mod win {
             });
         }
 
-        // Only active paths have meaningful source relationships. If multiple
-        // active targets share a source, they are cloned displays. Persist an
-        // explicit clone-group id so inactive paths (whose source id is merely a
-        // possible route) are never mistaken for clones later.
-        let mut source_counts = HashMap::<(i32, u32, u32), usize>::new();
+        // Only active targets sharing a source are clones.
+        let mut source_counts = HashMap::<SourceKey, usize>::new();
         for monitor in monitors.iter().filter(|m| m.enabled) {
-            *source_counts
-                .entry((
-                    monitor.source_adapter_high,
-                    monitor.source_adapter_low,
-                    monitor.source_id,
-                ))
-                .or_default() += 1;
+            *source_counts.entry(monitor.source_key()).or_default() += 1;
         }
-        let mut source_groups = HashMap::<(i32, u32, u32), u32>::new();
+        let mut source_groups = HashMap::<SourceKey, u32>::new();
         let mut next_group = 1u32;
         for monitor in monitors.iter_mut().filter(|m| m.enabled) {
-            let key = (
-                monitor.source_adapter_high,
-                monitor.source_adapter_low,
-                monitor.source_id,
-            );
+            let key = monitor.source_key();
             if source_counts.get(&key).copied().unwrap_or(0) > 1 {
                 let group = *source_groups.entry(key).or_insert_with(|| {
                     let group = next_group;
@@ -173,61 +169,45 @@ mod win {
         let selected = select_paths(layout, &all.paths)?;
 
         let topology_flags = SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
-        let code = unsafe { SetDisplayConfig(Some(&selected), None, topology_flags) };
-        if code != 0 {
-            bail!(
-                "Windows rejected the requested monitor topology (SetDisplayConfig validate: {code})"
-            );
-        }
+        set_display_config(
+            &selected,
+            None,
+            topology_flags,
+            "Windows rejected the requested monitor topology",
+        )?;
 
         let apply_flags =
             SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE;
-        let code = unsafe { SetDisplayConfig(Some(&selected), None, apply_flags) };
-        if code != 0 {
-            bail!("failed to apply monitor topology (SetDisplayConfig: {code})");
-        }
+        set_display_config(
+            &selected,
+            None,
+            apply_flags,
+            "failed to apply monitor topology",
+        )?;
 
-        // Once all requested targets are active, query concrete modes and apply
-        // coordinates/resolution/refresh. This second pass is what allows a layout
-        // to re-enable a previously inactive target while still using Windows' best-mode logic.
+        // Re-query modes after activating targets, then apply saved geometry.
         let mut active = query(QDC_ONLY_ACTIVE_PATHS)?;
         patch_active_modes(layout, &mut active)?;
 
-        let code = unsafe {
-            SetDisplayConfig(
-                Some(&active.paths),
-                Some(&active.modes),
-                SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
-            )
-        };
-        if code != 0 {
-            bail!(
-                "topology was enabled, but Windows rejected its edited position/mode data (validate: {code})"
-            );
-        }
+        set_display_config(
+            &active.paths,
+            Some(&active.modes),
+            SDC_VALIDATE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
+            "topology was enabled, but Windows rejected its edited position/mode data",
+        )?;
 
-        let code = unsafe {
-            SetDisplayConfig(
-                Some(&active.paths),
-                Some(&active.modes),
-                SDC_APPLY
-                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-                    | SDC_ALLOW_CHANGES
-                    | SDC_SAVE_TO_DATABASE,
-            )
-        };
-        if code != 0 {
-            bail!(
-                "topology was enabled, but applying its edited position/mode data failed ({code})"
-            );
-        }
+        set_display_config(
+            &active.paths,
+            Some(&active.modes),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+            "topology was enabled, but applying its edited position/mode data failed",
+        )?;
 
         Ok(())
     }
 
     pub(super) fn startup_topology_needs_recovery_impl() -> Result<bool> {
-        // Display availability can briefly lag behind process startup. Only recover
-        // after the same unhealthy state survives a short retry window.
+        // Avoid recovery during the brief startup availability lag.
         for attempt in 0..4 {
             let active = query(QDC_ONLY_ACTIVE_PATHS)?;
             let availability: Vec<bool> = active
@@ -247,10 +227,9 @@ mod win {
     }
 
     fn topology_state_needs_recovery(active_target_availability: &[bool]) -> bool {
-        active_target_availability.len() <= 1
-            && active_target_availability
-                .iter()
-                .all(|available| !available)
+        active_target_availability
+            .iter()
+            .all(|available| !available)
     }
 
     pub(super) fn ensure_layout_available_impl(layout: &MonitorLayout) -> Result<()> {
@@ -258,6 +237,36 @@ mod win {
         let all = query(QDC_ALL_PATHS)?;
         select_paths(layout, &all.paths)?;
         Ok(())
+    }
+
+    pub(super) fn restore_connected_topology_impl() -> Result<()> {
+        // Ask CCD for the last persisted configuration that matches the monitors
+        // connected now. If Windows has no matching database entry, its topology
+        // and best-mode logic choose a usable arrangement (extended first on a
+        // desktop) instead of preserving an unavailable target.
+        let flags = SDC_APPLY | SDC_USE_DATABASE_CURRENT | SDC_ALLOW_CHANGES;
+        let code = unsafe { SetDisplayConfig(None, None, flags) };
+        if code != 0 {
+            bail!(
+                "Windows could not restore a topology for the currently connected monitors (SetDisplayConfig: {code})"
+            );
+        }
+
+        for attempt in 0..4 {
+            let active = query(QDC_ONLY_ACTIVE_PATHS)?;
+            if active
+                .paths
+                .iter()
+                .any(|path| path.targetInfo.targetAvailable.as_bool())
+            {
+                return Ok(());
+            }
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        bail!("Windows reported success but still has no available active display")
     }
 
     fn validate_layout(layout: &MonitorLayout) -> Result<()> {
@@ -370,16 +379,10 @@ mod win {
             }
         }
 
-        // Clone membership is explicit. Source ids on inactive paths only describe
-        // possible routes and must not accidentally turn two independently enabled
-        // monitors into a clone pair.
+        // Inactive source IDs are routes, not implicit clone membership.
         let mut groups: Vec<(SavedGroupKey, SourceKey, Vec<&MonitorConfig>)> = Vec::new();
         for monitor in layout.monitors.iter().filter(|m| m.enabled) {
-            let saved_source = (
-                monitor.source_adapter_high,
-                monitor.source_adapter_low,
-                monitor.source_id,
-            );
+            let saved_source = monitor.source_key();
             let group_key = match monitor.clone_group {
                 Some(group) => SavedGroupKey::Clone(group),
                 None => SavedGroupKey::Single(monitor.identity.stable_key()),
@@ -419,8 +422,7 @@ mod win {
                 matching_per_monitor.push(matching);
             }
 
-            // Every target in a clone group must be reachable from one common
-            // source. A single-monitor group naturally uses the same logic.
+            // A clone group's targets must share one reachable source.
             let mut common_sources: HashSet<SourceKey> = matching_per_monitor[0]
                 .iter()
                 .map(|path| source_key(path))
@@ -459,9 +461,7 @@ mod win {
             prepared_groups.push((monitors, matching_per_monitor, candidate_sources));
         }
 
-        // Source allocation is a bipartite matching problem. A greedy walk can let
-        // a flexible monitor consume the only source usable by a later clone group,
-        // even though a valid overall routing exists.
+        // Match groups globally so flexible groups do not consume a required source.
         let source_candidates: Vec<Vec<SourceKey>> = prepared_groups
             .iter()
             .map(|(_, _, sources)| sources.clone())
@@ -529,13 +529,8 @@ mod win {
             }
 
             let previous_owner = source_owner.get(&source).copied();
-            if previous_owner.is_none()
-                || assign_source(
-                    previous_owner.expect("checked above"),
-                    candidates,
-                    visited,
-                    source_owner,
-                )
+            if previous_owner
+                .is_none_or(|owner| assign_source(owner, candidates, visited, source_owner))
             {
                 source_owner.insert(source, group);
                 return true;
@@ -554,6 +549,8 @@ mod win {
             else {
                 continue;
             };
+
+            patch_target_settings(&mut active.paths[path_index], saved);
 
             let source_idx =
                 unsafe { active.paths[path_index].sourceInfo.Anonymous.modeInfoIdx } as usize;
@@ -574,13 +571,21 @@ mod win {
                 }
                 active.modes[source_idx].Anonymous.sourceMode = mode;
             }
-
-            if saved.refresh_hz >= 1.0 {
-                set_path_refresh_rate(&mut active.paths[path_index], saved_refresh_rational(saved));
-            }
         }
 
         Ok(())
+    }
+
+    fn patch_target_settings(path: &mut DISPLAYCONFIG_PATH_INFO, saved: &MonitorConfig) {
+        if let Some(rotation) = saved.rotation {
+            path.targetInfo.rotation = DISPLAYCONFIG_ROTATION(rotation);
+        }
+        if let Some(scaling) = saved.scaling {
+            path.targetInfo.scaling = DISPLAYCONFIG_SCALING(scaling);
+        }
+        if saved.refresh_hz >= 1.0 {
+            set_path_refresh_rate(path, saved_refresh_rational(saved));
+        }
     }
 
     fn set_path_refresh_rate(
@@ -589,12 +594,7 @@ mod win {
     ) {
         path.targetInfo.refreshRate = refresh_rate;
 
-        // QueryDisplayConfig supplied the target's current concrete timing mode.
-        // When that index remains valid, SetDisplayConfig uses the target mode's
-        // vSyncFreq instead of targetInfo.refreshRate, so a 60 Hz active mode wins
-        // over a requested 143.99 Hz. Keep the patched source mode, but omit the
-        // target mode so Windows' best-mode logic selects a supported timing for
-        // the requested refresh rate.
+        // Drop the concrete timing so Windows honors the requested refresh rate.
         path.targetInfo.Anonymous.modeInfoIdx = INVALID_MODE_INDEX;
     }
 
@@ -613,9 +613,7 @@ mod win {
             }
         }
 
-        // GUI-edited values do not necessarily have a canonical Windows rational.
-        // A millihertz denominator is accurate enough for normal display modes,
-        // while SDC_ALLOW_CHANGES lets Windows select a nearby workable mode.
+        // GUI values use millihertz precision; Windows may choose a nearby mode.
         let hz1000 = (saved.refresh_hz * 1000.0)
             .round()
             .clamp(1.0, u32::MAX as f32) as u32;
@@ -683,7 +681,7 @@ mod win {
         })
     }
 
-    fn source_key(path: &DISPLAYCONFIG_PATH_INFO) -> (i32, u32, u32) {
+    fn source_key(path: &DISPLAYCONFIG_PATH_INFO) -> SourceKey {
         (
             path.sourceInfo.adapterId.HighPart,
             path.sourceInfo.adapterId.LowPart,
@@ -706,6 +704,19 @@ mod win {
     fn wide_z(buf: &[u16]) -> String {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         String::from_utf16_lossy(&buf[..len])
+    }
+
+    fn set_display_config(
+        paths: &[DISPLAYCONFIG_PATH_INFO],
+        modes: Option<&[DISPLAYCONFIG_MODE_INFO]>,
+        flags: SET_DISPLAY_CONFIG_FLAGS,
+        action: &str,
+    ) -> Result<()> {
+        let code = unsafe { SetDisplayConfig(Some(paths), modes, flags) };
+        if code != 0 {
+            bail!("{action} (SetDisplayConfig: {code})");
+        }
+        Ok(())
     }
 
     fn query(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<Snapshot> {
@@ -767,11 +778,11 @@ mod win {
         }
 
         #[test]
-        fn startup_recovery_only_triggers_for_zero_or_one_unavailable_target() {
+        fn startup_recovery_triggers_when_no_active_target_is_available() {
             assert!(topology_state_needs_recovery(&[]));
             assert!(topology_state_needs_recovery(&[false]));
+            assert!(topology_state_needs_recovery(&[false, false]));
             assert!(!topology_state_needs_recovery(&[true]));
-            assert!(!topology_state_needs_recovery(&[false, false]));
             assert!(!topology_state_needs_recovery(&[false, true]));
         }
 
@@ -792,6 +803,39 @@ mod win {
                 unsafe { path.targetInfo.Anonymous.modeInfoIdx },
                 INVALID_MODE_INDEX
             );
+        }
+
+        #[test]
+        fn final_mode_patch_restores_saved_orientation_and_scaling() {
+            let mut path = DISPLAYCONFIG_PATH_INFO::default();
+            let saved = MonitorConfig {
+                identity: MonitorIdentity {
+                    device_path: String::new(),
+                    adapter_low: 1,
+                    adapter_high: 0,
+                    target_id: 1,
+                },
+                friendly_name: "Portrait monitor".into(),
+                enabled: true,
+                source_adapter_low: 1,
+                source_adapter_high: 0,
+                source_id: 0,
+                clone_group: None,
+                rotation: Some(2),
+                scaling: Some(3),
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                refresh_hz: 60.0,
+                refresh_numerator: Some(60),
+                refresh_denominator: Some(1),
+            };
+
+            patch_target_settings(&mut path, &saved);
+
+            assert_eq!(path.targetInfo.rotation, DISPLAYCONFIG_ROTATION(2));
+            assert_eq!(path.targetInfo.scaling, DISPLAYCONFIG_SCALING(3));
         }
     }
 }
@@ -814,4 +858,9 @@ pub fn startup_topology_needs_recovery() -> Result<bool> {
 #[cfg(windows)]
 pub fn ensure_layout_available(layout: &MonitorLayout) -> Result<()> {
     win::ensure_layout_available_impl(layout)
+}
+
+#[cfg(windows)]
+pub fn restore_connected_topology() -> Result<()> {
+    win::restore_connected_topology_impl()
 }
