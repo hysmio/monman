@@ -37,6 +37,10 @@ Windows, so Windows deactivates the display path.
   Windows later starts with zero/one active path whose target is unavailable, restore
   that topology only after every enabled fallback monitor is confirmed present and routable.
 - Keep a backup of the last parseable `layouts.json` and recover from it if the primary file becomes unreadable/corrupt.
+- Allow only one MonMan process per Windows session. Launching it again restores and
+  focuses the existing window instead of creating duplicate tray icons or hotkeys.
+- Check the latest stable GitHub release on startup and offer a verified one-click
+  installer update when its semantic version is newer.
 - Refuse to apply an all-off layout.
 - Refuse to silently substitute a different target when a required saved monitor is
   disconnected.
@@ -84,6 +88,50 @@ target\release\monman.exe
 The project currently targets Rust edition 2024 and uses `windows` 0.62.2 and
 `eframe` 0.34.1.
 
+## Install and update
+
+Each GitHub release contains a versioned portable executable and a versioned installer:
+
+```text
+monman-v0.1.0-windows-x86_64.exe
+monman-v0.1.0-windows-x86_64-setup.exe
+```
+
+The installer is per-user and installs MonMan under
+`%LOCALAPPDATA%\Programs\MonMan`, so it does not require administrator access. It
+also creates a Start menu shortcut and can optionally create a desktop shortcut.
+
+MonMan checks GitHub's latest stable release in the background at startup. If its
+semantic version is newer than the running build, an update button appears in the
+sidebar. MonMan downloads the matching installer, checks its size and GitHub-provided
+SHA-256 digest, starts a silent upgrade, exits, and is restarted by the installer.
+Pre-releases are published but are not offered by the automatic update check.
+
+The installer is not currently code-signed, so Windows SmartScreen may warn on a newly
+downloaded build. SHA-256 verification detects a corrupted or mismatched download, but
+a trusted Authenticode certificate is still the appropriate next step for publisher
+identity and fewer SmartScreen warnings.
+
+## Publishing a release
+
+Release automation starts when a `v`-prefixed semantic-version tag is pushed. The tag
+must exactly match the package version in `Cargo.toml`; for example:
+
+```powershell
+# First change package.version in Cargo.toml to 0.2.0, then update and commit Cargo.lock.
+cargo check
+git add Cargo.toml Cargo.lock
+git commit -m "release: v0.2.0"
+git tag v0.2.0
+git push origin main
+git push origin v0.2.0
+```
+
+The Windows workflow tests and builds that exact tagged commit, compiles the Inno Setup
+installer, creates a GitHub release with generated notes, and uploads both versioned
+assets. Tags with a semantic-version pre-release suffix, such as `v0.2.0-beta.1`, create
+a GitHub pre-release. Rerunning the workflow replaces the assets on an existing release.
+
 ## Using it
 
 1. Start MonMan.
@@ -113,10 +161,11 @@ two-stage CCD apply fails after changing active paths, it attempts to restore th
 After a successful apply, **Undo last apply** restores the snapshot manually.
 
 MonMan also stores a separate last-known-working topology in `layouts.json`. At startup it
-waits briefly for display enumeration to settle. Automatic recovery is attempted only when
-there are no available active targets in a zero/single-path topology, and only when Windows
-currently exposes valid routes to every monitor that the fallback would enable. A missing
-fallback monitor causes recovery to be skipped rather than substituted.
+waits briefly for display enumeration to settle. Automatic recovery is attempted when there
+are no available active targets. MonMan first restores the exact saved topology when every
+required monitor is present. If that topology is stale (for example, it requires a powered-off
+TV), MonMan asks Windows to restore its persisted topology for the monitors connected now,
+then records the result as the new last-known-working topology.
 
 ## Important distinction: Windows-disable vs hardware power-off
 
