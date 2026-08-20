@@ -93,8 +93,8 @@ The project currently targets Rust edition 2024 and uses `windows` 0.62.2 and
 Each GitHub release contains a versioned portable executable and a versioned installer:
 
 ```text
-monman-v1.0.0-windows-x86_64.exe
-monman-v1.0.0-windows-x86_64-setup.exe
+monman-v1.0.1-windows-x86_64.exe
+monman-v1.0.1-windows-x86_64-setup.exe
 ```
 
 The installer is per-user and installs MonMan under
