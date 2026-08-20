@@ -27,8 +27,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("MonMan")
             .with_icon(app_icon)
-            .with_inner_size([1040.0, 700.0])
-            .with_min_inner_size([820.0, 560.0]),
+            .with_inner_size([1360.0, 850.0])
+            .with_min_inner_size([680.0, 560.0]),
         ..Default::default()
     };
 

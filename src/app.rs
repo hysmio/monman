@@ -10,6 +10,10 @@ use crate::updater::{AvailableUpdate, UpdateEvent, UpdateManager};
 use eframe::egui;
 use std::time::{Duration, Instant};
 
+const SIDEBAR_BREAKPOINT: f32 = 900.0;
+const SHORTCUT_CARD_BREAKPOINT: f32 = 820.0;
+const DISPLAY_TABLE_BREAKPOINT: f32 = 760.0;
+
 pub struct MonManApp {
     config: AppConfig,
     selected: Option<usize>,
@@ -53,6 +57,8 @@ impl AppStatus {
 
 impl MonManApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_ui_style(&cc.egui_ctx);
+
         let (mut config, mut status) = match storage::load() {
             Ok(config) => (config, AppStatus::info("Ready")),
             Err(err) => (
@@ -630,49 +636,70 @@ impl MonManApp {
 
     fn sidebar(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::left("layout_list")
-            .resizable(true)
-            .default_size(245.0)
+            .resizable(false)
+            .default_size(210.0)
+            .min_size(210.0)
+            .max_size(210.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(sidebar_fill())
+                    .inner_margin(12)
+                    .stroke(egui::Stroke::new(1.0_f32, border_color())),
+            )
             .show_inside(root_ui, |ui| {
                 ui.heading("Layouts");
-                ui.add_space(6.0);
+                ui.add_space(8.0);
 
-                if ui.button("＋ Capture current layout").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 36.0],
+                        egui::Button::new("Capture current"),
+                    )
+                    .clicked()
+                {
                     self.capture_new();
                 }
-                if ui.button("＋ New custom layout").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 36.0],
+                        egui::Button::new("+  New layout"),
+                    )
+                    .clicked()
+                {
                     self.create_custom();
                 }
 
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (index, layout) in self.config.layouts.iter().enumerate() {
-                        let hotkey = layout
-                            .hotkey
-                            .map(|h| format!("  [{}]", h.label()))
-                            .unwrap_or_default();
-                        let controller = layout
-                            .controller_hotkey
-                            .as_ref()
-                            .map(|_| "  [controller]")
-                            .unwrap_or_default();
-                        if ui
-                            .selectable_label(
-                                self.selected == Some(index),
-                                format!("{}{}{}", layout.name, hotkey, controller),
-                            )
-                            .clicked()
-                        {
-                            self.selected = Some(index);
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("layout_navigation")
+                    .show(ui, |ui| {
+                        for (index, layout) in self.config.layouts.iter().enumerate() {
+                            let label = layout.name.clone();
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 40.0],
+                                    egui::Button::selectable(self.selected == Some(index), label),
+                                )
+                                .clicked()
+                            {
+                                self.selected = Some(index);
+                            }
                         }
-                    }
-                });
+                    });
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    if ui.button("Quit MonMan").clicked() {
+                    ui.menu_button("More…", |ui| {
+                        ui.label(format!("MonMan v{}", env!("CARGO_PKG_VERSION")));
+                        ui.label("Changes save automatically");
+                    });
+                    if sidebar_footer_button(ui, "Quit").clicked() {
                         self.request_exit(ui.ctx());
                     }
                     if ui
-                        .add_enabled(self.tray.is_some(), egui::Button::new("Hide to tray"))
+                        .add_enabled_ui(self.tray.is_some(), |ui| {
+                            sidebar_footer_button(ui, "Hide to tray")
+                        })
+                        .inner
                         .on_hover_text(
                             "Hide the window while keeping keyboard and controller hotkeys active",
                         )
@@ -680,31 +707,30 @@ impl MonManApp {
                     {
                         self.hide_to_tray(ui.ctx());
                     }
-                    ui.separator();
-                    if ui.button("Save now").clicked() {
-                        self.save_now();
-                    }
-                    ui.small("Changes are also saved automatically.");
-                    ui.add_space(4.0);
-                    if ui
-                        .add_enabled(self.undo_layout.is_some(), egui::Button::new("Undo last apply"))
+                    if sidebar_footer_button(ui, "Undo last apply")
                         .on_hover_text("Restore the Windows topology captured immediately before the last successful apply")
                         .clicked()
+                        && self.undo_layout.is_some()
                     {
                         self.undo_last_apply();
                     }
+                    if sidebar_footer_button(ui, "Save").clicked() {
+                        self.save_now();
+                    }
                     ui.separator();
-                    ui.small(format!("MonMan v{}", env!("CARGO_PKG_VERSION")));
                     if let Some(update) = self.available_update.clone()
                         && ui
-                            .add_enabled(
-                                !self.update_in_progress,
-                                egui::Button::new(if self.update_in_progress {
-                                    format!("Installing {}…", update.tag)
-                                } else {
-                                    format!("Update to {}", update.tag)
-                                }),
-                            )
+                            .add_enabled_ui(!self.update_in_progress, |ui| {
+                                ui.add_sized(
+                                    [ui.available_width(), 30.0],
+                                    egui::Button::new(if self.update_in_progress {
+                                        format!("Installing {}…", update.tag)
+                                    } else {
+                                        format!("Update to {}", update.tag)
+                                    }),
+                                )
+                            })
+                            .inner
                             .on_hover_text(
                                 "Download the GitHub release asset, verify its SHA-256 digest, install it, and restart MonMan",
                             )
@@ -719,109 +745,235 @@ impl MonManApp {
             });
     }
 
-    fn editor(&mut self, root_ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
-            let Some(index) = self.selected else {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("No layout selected");
-                    ui.label("Capture the current Windows display topology to get started.");
+    fn compact_navigation(&mut self, root_ui: &mut egui::Ui) {
+        let mut action = None;
+        let mut capture_current = false;
+        let mut new_layout = false;
+        egui::Panel::top("compact_layout_navigation")
+            .frame(
+                egui::Frame::new()
+                    .fill(header_fill())
+                    .inner_margin(10)
+                    .stroke(egui::Stroke::new(1.0_f32, border_color())),
+            )
+            .show_inside(root_ui, |ui| {
+                ui.horizontal(|ui| {
+                    let selected_name = self
+                        .selected
+                        .and_then(|index| self.config.layouts.get(index))
+                        .map(|layout| layout.name.as_str())
+                        .unwrap_or("Choose a layout");
+                    egui::ComboBox::from_id_salt("compact_layout_selector")
+                        .selected_text(selected_name)
+                        .width((ui.available_width() - 190.0).clamp(150.0, 260.0))
+                        .show_ui(ui, |ui| {
+                            for (index, layout) in self.config.layouts.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected, Some(index), &layout.name);
+                            }
+                        });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.menu_button("•••", |ui| {
+                            ui.set_min_width(210.0);
+                            if ui.button("Capture current").clicked() {
+                                capture_current = true;
+                                ui.close();
+                            }
+                            if ui.button("New layout").clicked() {
+                                new_layout = true;
+                                ui.close();
+                            }
+                            if self.selected.is_some() {
+                                ui.separator();
+                                layout_action_menu(ui, &mut action);
+                            }
+                        });
+                        if ui
+                            .add_enabled(
+                                self.selected.is_some(),
+                                egui::Button::new(egui::RichText::new("Apply layout").strong())
+                                    .fill(accent_color())
+                                    .min_size(egui::vec2(116.0, 34.0)),
+                            )
+                            .clicked()
+                        {
+                            action = Some(LayoutAction::Apply);
+                        }
+                    });
                 });
-                return;
-            };
+            });
 
-            if index >= self.config.layouts.len() {
-                self.selected = None;
-                return;
-            }
+        if capture_current {
+            self.capture_new();
+        }
+        if new_layout {
+            self.create_custom();
+        }
+        if let Some(index) = self.selected {
+            self.perform_layout_action(index, action);
+        }
+    }
 
-            let capture_active = self.controller_capture_layout == Some(index);
-            let capture_elsewhere = self.controller_capture_layout.is_some() && !capture_active;
-            let capture_status = self.controller_capture_status.clone();
-            let connected_controllers = self
-                .controller_devices
-                .iter()
-                .map(ControllerDeviceInfo::label)
-                .collect::<Vec<_>>();
+    fn editor(&mut self, root_ui: &mut egui::Ui, show_layout_header: bool) {
+        egui::CentralPanel::default().show_inside(root_ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("layout_editor_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let Some(index) = self.selected else {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(100.0);
+                            ui.heading("No layout selected");
+                            ui.label(
+                                "Capture the current Windows display topology to get started.",
+                            );
+                        });
+                        return;
+                    };
 
-            let (layout_action, hotkeys_changed, controller_edit, layout_changed) = {
-                let layout = &mut self.config.layouts[index];
-                let (name_changed, layout_action) = layout_toolbar(ui, layout);
+                    if index >= self.config.layouts.len() {
+                        self.selected = None;
+                        return;
+                    }
 
-                ui.add_space(10.0);
-                let hotkeys_changed = global_hotkey_editor(ui, layout, index);
+                    let capture_active = self.controller_capture_layout == Some(index);
+                    let capture_elsewhere =
+                        self.controller_capture_layout.is_some() && !capture_active;
+                    let capture_status = self.controller_capture_status.clone();
+                    let connected_controllers = self
+                        .controller_devices
+                        .iter()
+                        .map(ControllerDeviceInfo::label)
+                        .collect::<Vec<_>>();
 
-                ui.add_space(8.0);
-                let controller_edit = controller_hotkey_editor(
-                    ui,
-                    layout,
-                    capture_active,
-                    capture_elsewhere,
-                    &capture_status,
-                    &connected_controllers,
-                );
-                let monitor_changed = monitor_editor(ui, layout, index);
-                let layout_changed = name_changed
-                    || hotkeys_changed
-                    || monitor_changed
-                    || controller_edit == Some(ControllerEdit::Clear);
+                    let (layout_action, hotkeys_changed, controller_edit, layout_changed) = {
+                        let layout = &mut self.config.layouts[index];
+                        let (name_changed, layout_action) = if show_layout_header {
+                            layout_header(ui, layout, index)
+                        } else {
+                            (false, None)
+                        };
 
-                (
-                    layout_action,
-                    hotkeys_changed,
-                    controller_edit,
-                    layout_changed,
-                )
-            };
+                        if show_layout_header {
+                            ui.add_space(10.0);
+                        }
+                        let arrangement_changed = monitor_arrangement_editor(ui, layout, index);
+                        ui.add_space(10.0);
+                        let (hotkeys_changed, controller_edit) = shortcut_editors(
+                            ui,
+                            layout,
+                            index,
+                            capture_active,
+                            capture_elsewhere,
+                            &capture_status,
+                            &connected_controllers,
+                        );
+                        ui.add_space(10.0);
+                        let monitor_changed = monitor_list_editor(ui, layout, index);
+                        let layout_changed = name_changed
+                            || hotkeys_changed
+                            || arrangement_changed
+                            || monitor_changed
+                            || controller_edit == Some(ControllerEdit::Clear);
 
-            self.dirty |= layout_changed;
-            if hotkeys_changed {
-                self.refresh_hotkeys();
-            }
-            match controller_edit {
-                Some(ControllerEdit::Clear) => {
-                    self.refresh_controller_hotkeys();
-                    self.status = AppStatus::info("Controller hotkey cleared");
-                }
-                Some(ControllerEdit::CancelCapture) => self.cancel_controller_capture(),
-                Some(ControllerEdit::BeginCapture) => self.begin_controller_capture(index),
-                None => {}
-            }
+                        (
+                            layout_action,
+                            hotkeys_changed,
+                            controller_edit,
+                            layout_changed,
+                        )
+                    };
 
-            match layout_action {
-                Some(LayoutAction::Delete) => {
-                    self.delete_layout(index);
-                }
-                Some(LayoutAction::Duplicate) => {
-                    self.duplicate_selected();
-                }
-                Some(LayoutAction::Recapture) => self.recapture_selected(),
-                Some(LayoutAction::SyncMonitors) => self.merge_connected_monitors(),
-                Some(LayoutAction::Apply) => self.apply_index(index),
-                None => {}
-            }
+                    self.dirty |= layout_changed;
+                    if hotkeys_changed {
+                        self.refresh_hotkeys();
+                    }
+                    match controller_edit {
+                        Some(ControllerEdit::Clear) => {
+                            self.refresh_controller_hotkeys();
+                            self.status = AppStatus::info("Controller hotkey cleared");
+                        }
+                        Some(ControllerEdit::CancelCapture) => self.cancel_controller_capture(),
+                        Some(ControllerEdit::BeginCapture) => self.begin_controller_capture(index),
+                        None => {}
+                    }
+
+                    self.perform_layout_action(index, layout_action);
+                });
         });
     }
+
+    fn perform_layout_action(&mut self, index: usize, action: Option<LayoutAction>) {
+        match action {
+            Some(LayoutAction::Delete) => self.delete_layout(index),
+            Some(LayoutAction::Duplicate) => self.duplicate_selected(),
+            Some(LayoutAction::Recapture) => self.recapture_selected(),
+            Some(LayoutAction::SyncMonitors) => self.merge_connected_monitors(),
+            Some(LayoutAction::Apply) => self.apply_index(index),
+            None => {}
+        }
+    }
+
     fn status_bar(&mut self, root_ui: &mut egui::Ui) {
-        egui::Panel::bottom("status_bar").show_inside(root_ui, |ui| {
-            ui.horizontal(|ui| {
-                let color = if self.status.is_error {
-                    ui.visuals().error_fg_color
-                } else {
-                    ui.visuals().text_color()
-                };
-                ui.colored_label(color, &self.status.message);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Config: {}",
-                            storage::config_path().display()
-                        ))
-                        .small(),
+        let compact = root_ui.available_width() < SIDEBAR_BREAKPOINT;
+        egui::Panel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(sidebar_fill())
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .stroke(egui::Stroke::new(1.0_f32, border_color())),
+            )
+            .show_inside(root_ui, |ui| {
+                ui.columns(2, |columns| {
+                    let color = if self.status.is_error {
+                        columns[0].visuals().error_fg_color
+                    } else {
+                        columns[0].visuals().text_color()
+                    };
+                    columns[0].horizontal(|ui| {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            dot_rect.center(),
+                            4.5,
+                            if self.status.is_error {
+                                ui.visuals().error_fg_color
+                            } else {
+                                egui::Color32::from_rgb(74, 196, 100)
+                            },
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.status.message)
+                                    .color(color)
+                                    .small(),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&self.status.message);
+                    });
+
+                    let config_path = storage::config_path();
+                    columns[1].with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label("Config")
+                                .on_hover_text(config_path.display().to_string());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(if compact {
+                                        String::new()
+                                    } else {
+                                        config_path.display().to_string()
+                                    })
+                                    .small(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(config_path.display().to_string());
+                        },
                     );
                 });
             });
-        });
     }
 }
 
@@ -841,135 +993,326 @@ enum ControllerEdit {
     Clear,
 }
 
-fn layout_toolbar(ui: &mut egui::Ui, layout: &mut MonitorLayout) -> (bool, Option<LayoutAction>) {
-    let mut action = None;
-    let name_changed = ui
-        .horizontal_wrapped(|ui| {
-            ui.label("Name");
-            let changed = ui.text_edit_singleline(&mut layout.name).changed();
-            for (label, candidate) in [
-                ("Apply", LayoutAction::Apply),
-                ("Capture current into this", LayoutAction::Recapture),
-                ("Sync connected monitors", LayoutAction::SyncMonitors),
-                ("Duplicate", LayoutAction::Duplicate),
-                ("Delete", LayoutAction::Delete),
-            ] {
-                if ui.button(label).clicked() {
-                    action = Some(candidate);
-                }
-            }
-            changed
+fn section_frame<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let available_width = ui.available_width();
+    egui::Frame::new()
+        .fill(card_fill())
+        .stroke(egui::Stroke::new(1.0_f32, border_color()))
+        .inner_margin(12)
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.set_min_width((available_width - 24.0).max(0.0));
+            add_contents(ui)
         })
-        .inner;
+}
+
+fn sidebar_footer_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(egui::Button::new(label).frame(false))
+}
+
+fn layout_action_menu(ui: &mut egui::Ui, action: &mut Option<LayoutAction>) {
+    for (label, candidate) in [
+        ("Replace with current", LayoutAction::Recapture),
+        ("Sync connected monitors", LayoutAction::SyncMonitors),
+        ("Duplicate layout", LayoutAction::Duplicate),
+    ] {
+        if ui.button(label).clicked() {
+            *action = Some(candidate);
+            ui.close();
+        }
+    }
+    ui.separator();
+    if ui
+        .button(egui::RichText::new("Delete layout").color(ui.visuals().error_fg_color))
+        .clicked()
+    {
+        *action = Some(LayoutAction::Delete);
+        ui.close();
+    }
+}
+
+fn layout_header(
+    ui: &mut egui::Ui,
+    layout: &mut MonitorLayout,
+    layout_index: usize,
+) -> (bool, Option<LayoutAction>) {
+    let mut action = None;
+    let mut name_changed = false;
+    let edit_id = ui.make_persistent_id(("editing_layout_name", layout_index));
+    let mut editing_name = ui
+        .data(|data| data.get_temp::<bool>(edit_id))
+        .unwrap_or(false);
+    egui::Frame::new()
+        .fill(header_fill())
+        .stroke(egui::Stroke::new(1.0_f32, border_color()))
+        .inner_margin(10)
+        .corner_radius(7)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if editing_name {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut layout.name)
+                            .font(egui::TextStyle::Heading)
+                            .desired_width((ui.available_width() - 190.0).clamp(180.0, 360.0))
+                            .hint_text("Layout name"),
+                    );
+                    name_changed |= response.changed();
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        editing_name = false;
+                    }
+                } else {
+                    ui.heading(&layout.name);
+                    if pencil_button(ui)
+                        .on_hover_text("Rename this layout")
+                        .clicked()
+                    {
+                        editing_name = true;
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("•••", |ui| {
+                        ui.set_min_width(210.0);
+                        layout_action_menu(ui, &mut action);
+                    });
+                    if ui
+                        .add_sized(
+                            [126.0, 34.0],
+                            egui::Button::new(egui::RichText::new("Apply layout").strong())
+                                .fill(accent_color()),
+                        )
+                        .clicked()
+                    {
+                        action = Some(LayoutAction::Apply);
+                    }
+                });
+            });
+        });
+    ui.data_mut(|data| data.insert_temp(edit_id, editing_name));
     (name_changed, action)
+}
+
+fn shortcut_editors(
+    ui: &mut egui::Ui,
+    layout: &mut MonitorLayout,
+    index: usize,
+    capture_active: bool,
+    capture_elsewhere: bool,
+    capture_status: &str,
+    connected_controllers: &[String],
+) -> (bool, Option<ControllerEdit>) {
+    if ui.available_width() >= SHORTCUT_CARD_BREAKPOINT {
+        let mut hotkeys_changed = false;
+        let mut controller_edit = None;
+        ui.columns(2, |columns| {
+            hotkeys_changed = global_hotkey_editor(&mut columns[0], layout, index);
+            controller_edit = controller_hotkey_editor(
+                &mut columns[1],
+                layout,
+                index,
+                capture_active,
+                capture_elsewhere,
+                capture_status,
+                connected_controllers,
+            );
+        });
+        (hotkeys_changed, controller_edit)
+    } else {
+        let hotkeys_changed = global_hotkey_editor(ui, layout, index);
+        ui.add_space(8.0);
+        let controller_edit = controller_hotkey_editor(
+            ui,
+            layout,
+            index,
+            capture_active,
+            capture_elsewhere,
+            capture_status,
+            connected_controllers,
+        );
+        (hotkeys_changed, controller_edit)
+    }
 }
 
 fn global_hotkey_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -> bool {
     let mut changed = false;
-    ui.group(|ui| {
-        ui.horizontal(|ui| {
-            ui.strong("Global hotkey");
+    let edit_id = ui.make_persistent_id(("keyboard_shortcut_edit", index));
+    let mut editing = ui
+        .data(|data| data.get_temp::<bool>(edit_id))
+        .unwrap_or(false);
+    section_frame(ui, |ui| {
+        ui.strong("⌨  Keyboard shortcut");
+        let binding_label = layout
+            .hotkey
+            .map(|binding| binding.label())
+            .unwrap_or_else(|| "No shortcut assigned".to_string());
+        shortcut_value_row(ui, &binding_label, &mut editing);
+
+        if editing {
+            ui.separator();
             let mut enabled = layout.hotkey.is_some();
             if ui.checkbox(&mut enabled, "Enabled").changed() {
                 layout.hotkey = enabled.then_some(HotkeyBinding::default());
                 changed = true;
             }
-        });
 
-        let Some(binding) = layout.hotkey.as_mut() else {
-            return;
-        };
-        ui.horizontal_wrapped(|ui| {
-            changed |= ui.checkbox(&mut binding.ctrl, "Ctrl").changed();
-            changed |= ui.checkbox(&mut binding.alt, "Alt").changed();
-            changed |= ui.checkbox(&mut binding.shift, "Shift").changed();
-            changed |= ui.checkbox(&mut binding.win, "Win").changed();
+            if let Some(binding) = layout.hotkey.as_mut() {
+                ui.horizontal_wrapped(|ui| {
+                    changed |= ui.checkbox(&mut binding.ctrl, "Ctrl").changed();
+                    changed |= ui.checkbox(&mut binding.alt, "Alt").changed();
+                    changed |= ui.checkbox(&mut binding.shift, "Shift").changed();
+                    changed |= ui.checkbox(&mut binding.win, "Win").changed();
 
-            egui::ComboBox::from_id_salt(("hotkey_key", index))
-                .selected_text(binding.key.label())
-                .show_ui(ui, |ui| {
-                    for key in HotkeyKey::ALL {
-                        changed |= ui
-                            .selectable_value(&mut binding.key, key, key.label())
-                            .changed();
-                    }
+                    egui::ComboBox::from_id_salt(("hotkey_key", index))
+                        .selected_text(binding.key.label())
+                        .show_ui(ui, |ui| {
+                            for key in HotkeyKey::ALL {
+                                changed |= ui
+                                    .selectable_value(&mut binding.key, key, key.label())
+                                    .changed();
+                            }
+                        });
                 });
-            ui.label(format!("→ {}", binding.label()));
-        });
-        if !binding.has_modifier() {
-            ui.colored_label(
-                ui.visuals().error_fg_color,
-                "Choose at least one modifier for a global hotkey.",
-            );
+                if !binding.has_modifier() {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        "Choose at least one modifier for a global hotkey.",
+                    );
+                }
+            }
         }
     });
+    ui.data_mut(|data| data.insert_temp(edit_id, editing));
     changed
+}
+
+fn shortcut_value_row(ui: &mut egui::Ui, value: &str, editing: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if pencil_button(ui).on_hover_text("Edit shortcut").clicked() {
+                *editing = !*editing;
+            }
+            if ui
+                .add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new(value).fill(input_fill()),
+                )
+                .clicked()
+            {
+                *editing = !*editing;
+            }
+        });
+    });
+}
+
+fn pencil_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(36.0, 34.0), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect_filled(rect, 6.0, visuals.bg_fill);
+    paint_rect_outline(ui.painter(), rect, visuals.bg_stroke);
+    let center = rect.center();
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-5.0, 5.0),
+            center + egui::vec2(5.0, -5.0),
+        ],
+        egui::Stroke::new(2.0_f32, visuals.fg_stroke.color),
+    );
+    ui.painter().line_segment(
+        [
+            center + egui::vec2(-6.0, 6.0),
+            center + egui::vec2(-3.0, 5.0),
+        ],
+        egui::Stroke::new(2.0_f32, visuals.fg_stroke.color),
+    );
+    response
+}
+
+fn paint_rect_outline(painter: &egui::Painter, rect: egui::Rect, stroke: egui::Stroke) {
+    painter.line_segment([rect.left_top(), rect.right_top()], stroke);
+    painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+    painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
+    painter.line_segment([rect.left_bottom(), rect.left_top()], stroke);
 }
 
 fn controller_hotkey_editor(
     ui: &mut egui::Ui,
     layout: &mut MonitorLayout,
+    layout_index: usize,
     capture_active: bool,
     capture_elsewhere: bool,
     capture_status: &str,
     connected_controllers: &[String],
 ) -> Option<ControllerEdit> {
     let mut action = None;
-    ui.group(|ui| {
-        ui.strong("Controller hotkey");
-        match layout.controller_hotkey.as_ref() {
-            Some(binding) => ui.label(binding.label()),
-            None => ui.label("No controller chord assigned to this layout."),
-        };
+    let edit_id = ui.make_persistent_id(("controller_shortcut_edit", layout_index));
+    let mut editing = ui
+        .data(|data| data.get_temp::<bool>(edit_id))
+        .unwrap_or(false)
+        || capture_active;
+    section_frame(ui, |ui| {
+        ui.strong("Controller shortcut");
+        let binding_label = layout
+            .controller_hotkey
+            .as_ref()
+            .map(|binding| binding.label())
+            .unwrap_or_else(|| "No shortcut assigned".to_string());
+        shortcut_value_row(ui, &binding_label, &mut editing);
 
-        ui.horizontal_wrapped(|ui| {
-            if capture_active {
-                ui.spinner();
-                if ui.button("Cancel listening").clicked() {
-                    action = Some(ControllerEdit::CancelCapture);
+        if editing {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if capture_active {
+                    ui.spinner();
+                    if ui.button("Cancel listening").clicked() {
+                        action = Some(ControllerEdit::CancelCapture);
+                    }
+                    return;
                 }
-                return;
+
+                let text = if layout.controller_hotkey.is_some() {
+                    "Rebind controller chord"
+                } else {
+                    "Bind controller chord"
+                };
+                if ui
+                    .add_enabled(!capture_elsewhere, egui::Button::new(text))
+                    .on_hover_text(
+                        "Release all buttons, press one button or a chord, then release it to save",
+                    )
+                    .clicked()
+                {
+                    action = Some(ControllerEdit::BeginCapture);
+                }
+                if ui
+                    .add_enabled(
+                        layout.controller_hotkey.is_some(),
+                        egui::Button::new("Clear"),
+                    )
+                    .clicked()
+                {
+                    layout.controller_hotkey = None;
+                    action = Some(ControllerEdit::Clear);
+                }
+            });
+
+            if capture_active {
+                ui.colored_label(ui.visuals().warn_fg_color, capture_status);
+            } else if capture_elsewhere {
+                ui.small("Controller listening is active for another layout.");
             }
 
-            let text = if layout.controller_hotkey.is_some() {
-                "Rebind controller chord"
+            if connected_controllers.is_empty() {
+                ui.small("No Windows game controller is currently connected.");
             } else {
-                "Bind controller chord"
-            };
-            if ui
-                .add_enabled(!capture_elsewhere, egui::Button::new(text))
-                .on_hover_text(
-                    "Release all buttons, press one button or a chord, then release it to save",
-                )
-                .clicked()
-            {
-                action = Some(ControllerEdit::BeginCapture);
+                ui.small(format!("Connected: {}", connected_controllers.join(", ")));
             }
-            if ui
-                .add_enabled(
-                    layout.controller_hotkey.is_some(),
-                    egui::Button::new("Clear"),
-                )
-                .clicked()
-            {
-                layout.controller_hotkey = None;
-                action = Some(ControllerEdit::Clear);
-            }
-        });
-
-        if capture_active {
-            ui.colored_label(ui.visuals().warn_fg_color, capture_status);
-        } else if capture_elsewhere {
-            ui.small("Controller listening is active for another layout.");
         }
-
-        if connected_controllers.is_empty() {
-            ui.small("No Windows game controller is currently connected.");
-        } else {
-            ui.small(format!("Connected: {}", connected_controllers.join(", ")));
-        }
-        ui.small("Controller hotkeys keep working while MonMan is hidden in the system tray.");
     });
+    ui.data_mut(|data| data.insert_temp(edit_id, editing));
     action
 }
 
@@ -982,148 +1325,80 @@ struct GeometryUpdate {
     height: u32,
 }
 
-fn monitor_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -> bool {
+struct MonitorCardResult {
+    changed: bool,
+    make_primary: bool,
+    geometry_update: Option<GeometryUpdate>,
+}
+
+fn monitor_arrangement_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -> bool {
     let mut changed = false;
-    ui.add_space(10.0);
     let enabled_count = layout
         .monitors
         .iter()
         .filter(|monitor| monitor.enabled)
         .count();
-    ui.horizontal(|ui| {
-        ui.heading("Monitor layout");
-        ui.label(format!(
-            "{} enabled / {} known",
-            enabled_count,
-            layout.monitors.len()
-        ));
+    section_frame(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.strong("Display arrangement");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        dot_rect.center(),
+                        4.0,
+                        if enabled_count == 0 {
+                            ui.visuals().error_fg_color
+                        } else {
+                            egui::Color32::from_rgb(74, 196, 100)
+                        },
+                    );
+                    ui.label(format!("{enabled_count} enabled"));
+                });
+            });
+        });
+        if enabled_count == 0 {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                "Enable at least one display before applying this layout.",
+            );
+        }
+        ui.add_space(2.0);
+        changed |= monitor_layout_canvas(ui, layout, index);
     });
-    ui.label(
-        "Drag monitors in the preview to edit their desktop coordinates. Enabled monitors snap to adjacent edges and matching top, middle, or bottom axes; the active snap is highlighted.",
-    );
-    if enabled_count == 0 {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            "This layout cannot be applied until at least one monitor is enabled.",
-        );
-    }
+    changed
+}
 
-    changed |= monitor_layout_canvas(ui, layout, index);
-
+fn monitor_list_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -> bool {
+    let mut changed = false;
     let mut make_primary = None;
     let mut geometry_update = None;
-    ui.add_space(8.0);
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            egui::Grid::new(("monitor_grid", index))
-                .striped(true)
-                .num_columns(11)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    for heading in [
-                        "On",
-                        "Monitor",
-                        "X",
-                        "Y",
-                        "Width",
-                        "Height",
-                        "Orientation",
-                        "Hz",
-                        "Primary",
-                        "Clone",
-                        "Identity",
-                    ] {
-                        ui.strong(heading);
-                    }
-                    ui.end_row();
-
-                    for (monitor_index, monitor) in layout.monitors.iter_mut().enumerate() {
-                        changed |= ui.checkbox(&mut monitor.enabled, "").changed();
-                        ui.label(&monitor.friendly_name);
-
-                        let mut geometry_changed = false;
-                        geometry_changed |= ui
-                            .add(egui::DragValue::new(&mut monitor.x).speed(10))
-                            .changed();
-                        geometry_changed |= ui
-                            .add(egui::DragValue::new(&mut monitor.y).speed(10))
-                            .changed();
-                        geometry_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut monitor.width)
-                                    .range(320..=16384)
-                                    .speed(10),
-                            )
-                            .changed();
-                        geometry_changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut monitor.height)
-                                    .range(200..=16384)
-                                    .speed(10),
-                            )
-                            .changed();
-
-                        let old_rotation = monitor.rotation.unwrap_or(0);
-                        let mut rotation = old_rotation;
-                        egui::ComboBox::from_id_salt(("monitor_rotation", index, monitor_index))
-                            .selected_text(rotation_label(rotation))
-                            .show_ui(ui, |ui| {
-                                for (value, label) in DISPLAY_ROTATIONS {
-                                    ui.selectable_value(&mut rotation, value, label);
-                                }
-                            });
-                        if rotation != old_rotation {
-                            monitor.rotation = Some(rotation);
-                            changed = true;
-                        }
-                        if geometry_changed {
-                            changed = true;
-                            geometry_update = Some(GeometryUpdate {
-                                source_index: monitor_index,
-                                clone_group: monitor.clone_group,
-                                x: monitor.x,
-                                y: monitor.y,
-                                width: monitor.width,
-                                height: monitor.height,
-                            });
-                        }
-
-                        if ui
-                            .add(
-                                egui::DragValue::new(&mut monitor.refresh_hz)
-                                    .range(1.0..=1000.0)
-                                    .speed(1.0)
-                                    .suffix(" Hz"),
-                            )
-                            .changed()
-                        {
-                            monitor.refresh_numerator = None;
-                            monitor.refresh_denominator = None;
-                            changed = true;
-                        }
-
-                        if monitor.enabled && monitor.x == 0 && monitor.y == 0 {
-                            ui.strong("Primary");
-                        } else if ui
-                            .add_enabled(monitor.enabled, egui::Button::new("Make primary"))
-                            .clicked()
-                        {
-                            make_primary = Some(monitor_index);
-                        }
-
-                        ui.label(
-                            monitor
-                                .clone_group
-                                .map(|group| format!("#{group}"))
-                                .unwrap_or_else(|| "—".to_string()),
-                        );
-                        ui.label(egui::RichText::new(monitor.identity.display_label()).small())
-                            .on_hover_text(&monitor.identity.device_path);
-                        ui.end_row();
-                    }
-                });
+    let show_table = ui.available_width() >= DISPLAY_TABLE_BREAKPOINT;
+    section_frame(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.strong("Displays");
+            ui.weak(format!("{} known", layout.monitors.len()));
         });
+        if show_table {
+            monitor_table_header(ui);
+        }
+        for (monitor_index, monitor) in layout.monitors.iter_mut().enumerate() {
+            let result = if show_table {
+                monitor_table_row(ui, monitor, index, monitor_index)
+            } else {
+                monitor_summary_card(ui, monitor, index, monitor_index)
+            };
+            changed |= result.changed;
+            if result.make_primary {
+                make_primary = Some(monitor_index);
+            }
+            if result.geometry_update.is_some() {
+                geometry_update = result.geometry_update;
+            }
+            ui.add_space(5.0);
+        }
+    });
 
     if let Some(update) = geometry_update
         && let Some(group) = update.clone_group
@@ -1150,6 +1425,349 @@ fn monitor_editor(ui: &mut egui::Ui, layout: &mut MonitorLayout, index: usize) -
     changed
 }
 
+fn monitor_table_header(ui: &mut egui::Ui) {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_sized([24.0, 20.0], egui::Label::new("On"));
+        ui.add_sized([30.0, 20.0], egui::Label::new("#"));
+        let name_width = (ui.available_width() - 474.0).clamp(120.0, 230.0);
+        ui.add_sized([name_width, 20.0], egui::Label::new("Name"));
+        ui.add_sized([112.0, 20.0], egui::Label::new("Resolution"));
+        ui.add_sized([112.0, 20.0], egui::Label::new("Orientation"));
+        ui.add_sized([76.0, 20.0], egui::Label::new("Refresh"));
+        ui.add_sized([72.0, 20.0], egui::Label::new("Primary"));
+    });
+    ui.separator();
+}
+
+fn monitor_table_row(
+    ui: &mut egui::Ui,
+    monitor: &mut MonitorConfig,
+    layout_index: usize,
+    monitor_index: usize,
+) -> MonitorCardResult {
+    let mut changed = false;
+    let mut make_primary = false;
+    let mut geometry_changed = false;
+    let details_id = ui.make_persistent_id(("monitor_details", layout_index, monitor_index));
+    let mut details_open = ui
+        .data(|data| data.get_temp::<bool>(details_id))
+        .unwrap_or(false);
+    let available_width = ui.available_width();
+    egui::Frame::new()
+        .fill(input_fill())
+        .stroke(egui::Stroke::new(1.0_f32, border_color()))
+        .inner_margin(8)
+        .corner_radius(6)
+        .show(ui, |ui| {
+            ui.set_min_width((available_width - 16.0).max(0.0));
+            let (display_width, display_height) = display_size(monitor);
+            let is_primary = monitor.enabled && monitor.x == 0 && monitor.y == 0;
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add_sized([24.0, 26.0], egui::Checkbox::new(&mut monitor.enabled, ""))
+                    .on_hover_text("Include this display in the layout")
+                    .changed();
+                ui.add_sized(
+                    [30.0, 26.0],
+                    egui::Button::new((monitor_index + 1).to_string()).fill(header_fill()),
+                );
+                let name_width = (ui.available_width() - 474.0).clamp(120.0, 230.0);
+                ui.add_sized(
+                    [name_width, 26.0],
+                    egui::Label::new(egui::RichText::new(&monitor.friendly_name).strong())
+                        .truncate(),
+                )
+                .on_hover_text(&monitor.friendly_name);
+                ui.add_sized(
+                    [112.0, 26.0],
+                    egui::Label::new(format!("{display_width} × {display_height}")),
+                );
+                ui.add_sized(
+                    [112.0, 26.0],
+                    egui::Label::new(rotation_label(monitor.rotation.unwrap_or(0))),
+                );
+                ui.add_sized(
+                    [76.0, 26.0],
+                    egui::Label::new(refresh_rate_label(monitor.refresh_hz)),
+                );
+                ui.add_sized(
+                    [72.0, 26.0],
+                    egui::Label::new(if is_primary {
+                        egui::RichText::new("Primary").color(accent_color())
+                    } else {
+                        egui::RichText::new("")
+                    }),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [28.0, 26.0],
+                            egui::Button::new(if details_open { "^" } else { "v" }),
+                        )
+                        .on_hover_text("Advanced display details")
+                        .clicked()
+                    {
+                        details_open = !details_open;
+                    }
+                });
+            });
+            if details_open {
+                ui.separator();
+                let result =
+                    monitor_details_editor(ui, monitor, layout_index, monitor_index, is_primary);
+                changed |= result.changed;
+                geometry_changed |= result.geometry_changed;
+                make_primary |= result.make_primary;
+            }
+        });
+    ui.data_mut(|data| data.insert_temp(details_id, details_open));
+    monitor_card_result(
+        monitor,
+        monitor_index,
+        changed,
+        geometry_changed,
+        make_primary,
+    )
+}
+
+fn monitor_summary_card(
+    ui: &mut egui::Ui,
+    monitor: &mut MonitorConfig,
+    layout_index: usize,
+    monitor_index: usize,
+) -> MonitorCardResult {
+    let mut changed = false;
+    let mut make_primary = false;
+    let mut geometry_changed = false;
+    let details_id = ui.make_persistent_id(("monitor_details", layout_index, monitor_index));
+    let mut details_open = ui
+        .data(|data| data.get_temp::<bool>(details_id))
+        .unwrap_or(false);
+
+    let available_width = ui.available_width();
+    egui::Frame::new()
+        .fill(input_fill())
+        .stroke(egui::Stroke::new(1.0_f32, border_color()))
+        .inner_margin(10)
+        .corner_radius(6)
+        .show(ui, |ui| {
+            ui.set_min_width((available_width - 20.0).max(0.0));
+            let (display_width, display_height) = display_size(monitor);
+            let is_primary = monitor.enabled && monitor.x == 0 && monitor.y == 0;
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .checkbox(&mut monitor.enabled, "")
+                    .on_hover_text("Include this display in the layout")
+                    .changed();
+                ui.add_sized(
+                    [30.0, 26.0],
+                    egui::Button::new((monitor_index + 1).to_string()).fill(header_fill()),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&monitor.friendly_name).strong())
+                        .truncate(),
+                )
+                .on_hover_text(&monitor.friendly_name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button(if details_open { "^" } else { "v" })
+                        .on_hover_text("Advanced display details")
+                        .clicked()
+                    {
+                        details_open = !details_open;
+                    }
+                    if is_primary {
+                        ui.label(
+                            egui::RichText::new("Primary")
+                                .strong()
+                                .color(accent_color()),
+                        );
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(62.0);
+                ui.weak(format!(
+                    "{display_width} × {display_height}   •   {}   •   {}",
+                    rotation_label(monitor.rotation.unwrap_or(0)),
+                    refresh_rate_label(monitor.refresh_hz)
+                ));
+            });
+
+            if details_open {
+                ui.separator();
+                let result =
+                    monitor_details_editor(ui, monitor, layout_index, monitor_index, is_primary);
+                changed |= result.changed;
+                geometry_changed |= result.geometry_changed;
+                make_primary |= result.make_primary;
+            }
+        });
+    ui.data_mut(|data| data.insert_temp(details_id, details_open));
+    monitor_card_result(
+        monitor,
+        monitor_index,
+        changed,
+        geometry_changed,
+        make_primary,
+    )
+}
+
+struct MonitorDetailsResult {
+    changed: bool,
+    geometry_changed: bool,
+    make_primary: bool,
+}
+
+fn monitor_details_editor(
+    ui: &mut egui::Ui,
+    monitor: &mut MonitorConfig,
+    layout_index: usize,
+    monitor_index: usize,
+    is_primary: bool,
+) -> MonitorDetailsResult {
+    let mut changed = false;
+    let mut geometry_changed = false;
+    let mut make_primary = false;
+    egui::Grid::new(("monitor_details_grid", layout_index, monitor_index))
+        .num_columns(2)
+        .spacing([18.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("Position");
+            ui.horizontal(|ui| {
+                ui.label("X");
+                geometry_changed |= ui
+                    .add_sized([80.0, 28.0], egui::DragValue::new(&mut monitor.x).speed(10))
+                    .changed();
+                ui.label("Y");
+                geometry_changed |= ui
+                    .add_sized([80.0, 28.0], egui::DragValue::new(&mut monitor.y).speed(10))
+                    .changed();
+            });
+            ui.end_row();
+
+            ui.label("Source resolution");
+            ui.horizontal(|ui| {
+                geometry_changed |= ui
+                    .add_sized(
+                        [92.0, 28.0],
+                        egui::DragValue::new(&mut monitor.width)
+                            .range(320..=16384)
+                            .speed(10),
+                    )
+                    .changed();
+                ui.label("×");
+                geometry_changed |= ui
+                    .add_sized(
+                        [92.0, 28.0],
+                        egui::DragValue::new(&mut monitor.height)
+                            .range(200..=16384)
+                            .speed(10),
+                    )
+                    .changed();
+            });
+            ui.end_row();
+
+            ui.label("Orientation");
+            let old_rotation = monitor.rotation.unwrap_or(0);
+            let mut rotation = old_rotation;
+            egui::ComboBox::from_id_salt(("monitor_rotation", layout_index, monitor_index))
+                .selected_text(rotation_label(rotation))
+                .width(210.0)
+                .show_ui(ui, |ui| {
+                    for (value, label) in DISPLAY_ROTATIONS {
+                        ui.selectable_value(&mut rotation, value, label);
+                    }
+                });
+            if rotation != old_rotation {
+                monitor.rotation = Some(rotation);
+                changed = true;
+            }
+            ui.end_row();
+
+            ui.label("Refresh rate");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut monitor.refresh_hz)
+                        .range(1.0..=1000.0)
+                        .speed(1.0)
+                        .suffix(" Hz"),
+                )
+                .changed()
+            {
+                monitor.refresh_numerator = None;
+                monitor.refresh_denominator = None;
+                changed = true;
+            }
+            ui.end_row();
+
+            ui.label("Primary display");
+            if is_primary {
+                ui.strong("Primary");
+            } else if ui
+                .add_enabled(monitor.enabled, egui::Button::new("Make primary"))
+                .clicked()
+            {
+                make_primary = true;
+            }
+            ui.end_row();
+
+            ui.label("Clone group");
+            ui.label(
+                monitor
+                    .clone_group
+                    .map(|group| format!("#{group}"))
+                    .unwrap_or_else(|| "None".to_string()),
+            );
+            ui.end_row();
+
+            ui.label("Identity");
+            ui.add(
+                egui::Label::new(egui::RichText::new(monitor.identity.display_label()).small())
+                    .truncate(),
+            )
+            .on_hover_text(&monitor.identity.device_path);
+            ui.end_row();
+        });
+    MonitorDetailsResult {
+        changed,
+        geometry_changed,
+        make_primary,
+    }
+}
+
+fn monitor_card_result(
+    monitor: &MonitorConfig,
+    monitor_index: usize,
+    changed: bool,
+    geometry_changed: bool,
+    make_primary: bool,
+) -> MonitorCardResult {
+    let geometry_update = geometry_changed.then_some(GeometryUpdate {
+        source_index: monitor_index,
+        clone_group: monitor.clone_group,
+        x: monitor.x,
+        y: monitor.y,
+        width: monitor.width,
+        height: monitor.height,
+    });
+
+    MonitorCardResult {
+        changed: changed || geometry_changed,
+        make_primary,
+        geometry_update,
+    }
+}
+
+fn refresh_rate_label(refresh_hz: f32) -> String {
+    if (refresh_hz - refresh_hz.round()).abs() < 0.01 {
+        format!("{refresh_hz:.0} Hz")
+    } else {
+        format!("{refresh_hz:.2} Hz")
+    }
+}
+
 impl eframe::App for MonManApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_hotkeys();
@@ -1169,9 +1787,14 @@ impl eframe::App for MonManApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.sidebar(ui);
+        let show_sidebar = ui.available_width() >= SIDEBAR_BREAKPOINT;
         self.status_bar(ui);
-        self.editor(ui);
+        if show_sidebar {
+            self.sidebar(ui);
+        } else {
+            self.compact_navigation(ui);
+        }
+        self.editor(ui, show_sidebar);
     }
 
     fn on_exit(&mut self) {
@@ -1179,6 +1802,69 @@ impl eframe::App for MonManApp {
             let _ = storage::save(&self.config);
         }
     }
+}
+
+fn configure_ui_style(ctx: &egui::Context) {
+    let mut style = (*ctx.global_style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.button_padding = egui::vec2(11.0, 6.0);
+    style.spacing.interact_size.y = 30.0;
+    style.visuals = egui::Visuals::dark();
+    style.visuals.panel_fill = app_fill();
+    style.visuals.window_fill = app_fill();
+    style.visuals.extreme_bg_color = canvas_fill();
+    style.visuals.faint_bg_color = input_fill();
+    style.visuals.selection.bg_fill = accent_color();
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    style.visuals.widgets.noninteractive.bg_fill = card_fill();
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border_color());
+    style.visuals.widgets.inactive.bg_fill = input_fill();
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border_color());
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(42, 51, 62);
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent_color());
+    style.visuals.widgets.active.bg_fill = accent_color();
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent_color());
+    style.visuals.widgets.open.bg_fill = input_fill();
+    style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, accent_color());
+    let corner_radius = egui::CornerRadius::same(7);
+    style.visuals.widgets.noninteractive.corner_radius = corner_radius;
+    style.visuals.widgets.inactive.corner_radius = corner_radius;
+    style.visuals.widgets.hovered.corner_radius = corner_radius;
+    style.visuals.widgets.active.corner_radius = corner_radius;
+    style.visuals.widgets.open.corner_radius = corner_radius;
+    ctx.set_global_style(style);
+}
+
+fn app_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(20, 26, 33)
+}
+
+fn sidebar_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(17, 23, 30)
+}
+
+fn header_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(23, 30, 38)
+}
+
+fn card_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(26, 34, 43)
+}
+
+fn input_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(18, 24, 31)
+}
+
+fn canvas_fill() -> egui::Color32 {
+    egui::Color32::from_rgb(12, 18, 24)
+}
+
+fn border_color() -> egui::Color32 {
+    egui::Color32::from_rgb(54, 65, 77)
+}
+
+fn accent_color() -> egui::Color32 {
+    egui::Color32::from_rgb(8, 103, 216)
 }
 
 fn working_snapshot(fallback: &MonitorLayout) -> MonitorLayout {
@@ -1234,9 +1920,24 @@ fn monitor_layout_canvas(
     layout_index: usize,
 ) -> bool {
     let width = ui.available_width().max(320.0);
-    let (response, painter) = ui.allocate_painter(egui::vec2(width, 285.0), egui::Sense::hover());
+    let height = if width < SHORTCUT_CARD_BREAKPOINT {
+        185.0
+    } else {
+        280.0
+    };
+    let (response, painter) = ui.allocate_painter(egui::vec2(width, height), egui::Sense::hover());
     let outer = response.rect;
-    painter.rect_filled(outer, 6.0, ui.visuals().extreme_bg_color);
+    painter.rect_filled(outer, 6.0, canvas_fill());
+    let grid_color = egui::Color32::from_rgb(45, 56, 67);
+    let mut grid_x = outer.left() + 12.0;
+    while grid_x < outer.right() - 8.0 {
+        let mut grid_y = outer.top() + 12.0;
+        while grid_y < outer.bottom() - 8.0 {
+            painter.circle_filled(egui::pos2(grid_x, grid_y), 0.75, grid_color);
+            grid_y += 16.0;
+        }
+        grid_x += 16.0;
+    }
 
     if layout.monitors.is_empty() {
         painter.text(
@@ -1276,28 +1977,6 @@ fn monitor_layout_canvas(
         )
     };
 
-    // Desktop origin marks the primary source.
-    let origin = to_screen(0.0, 0.0);
-    let origin_stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
-    if canvas.left() <= origin.x && origin.x <= canvas.right() {
-        painter.line_segment(
-            [
-                egui::pos2(origin.x, canvas.top()),
-                egui::pos2(origin.x, canvas.bottom()),
-            ],
-            origin_stroke,
-        );
-    }
-    if canvas.top() <= origin.y && origin.y <= canvas.bottom() {
-        painter.line_segment(
-            [
-                egui::pos2(canvas.left(), origin.y),
-                egui::pos2(canvas.right(), origin.y),
-            ],
-            origin_stroke,
-        );
-    }
-
     let mut changed = false;
     let mut snap_guides = Vec::new();
     for monitor_index in 0..layout.monitors.len() {
@@ -1311,9 +1990,8 @@ fn monitor_layout_canvas(
         let monitor_rect = egui::Rect::from_min_size(min, size);
         let enabled = monitor.enabled;
         let clone_group = monitor.clone_group;
-        let is_primary = enabled && monitor.x == 0 && monitor.y == 0;
-        let name = monitor.friendly_name.clone();
         let dimensions = format!("{display_width}×{display_height}");
+        let refresh_rate = refresh_rate_label(monitor.refresh_hz);
 
         let id = ui
             .id()
@@ -1394,14 +2072,21 @@ fn monitor_layout_canvas(
         let drawn_min = to_screen(drawn_monitor.x as f32, drawn_monitor.y as f32);
         let monitor_rect = egui::Rect::from_min_size(drawn_min, size);
         let fill = if enabled {
-            ui.visuals().widgets.inactive.bg_fill
+            header_fill()
         } else {
-            ui.visuals().widgets.noninteractive.bg_fill
+            egui::Color32::from_rgb(28, 34, 41)
         };
-        let border = if interaction.dragged() || interaction.hovered() {
-            ui.visuals().widgets.active.fg_stroke
+        let border = if enabled {
+            egui::Stroke::new(
+                if interaction.dragged() || interaction.hovered() {
+                    2.5_f32
+                } else {
+                    1.5_f32
+                },
+                accent_color(),
+            )
         } else {
-            ui.visuals().widgets.inactive.fg_stroke
+            egui::Stroke::new(1.0_f32, border_color())
         };
         painter.rect_filled(monitor_rect, 4.0, fill);
         painter.line_segment([monitor_rect.left_top(), monitor_rect.right_top()], border);
@@ -1418,17 +2103,21 @@ fn monitor_layout_canvas(
             border,
         );
 
-        let label = if is_primary {
-            format!("{name}\n{dimensions}\nPRIMARY")
-        } else if enabled {
-            format!("{name}\n{dimensions}")
-        } else {
-            format!("{name}\n{dimensions}\nOFF")
-        };
         painter.text(
-            monitor_rect.center(),
+            monitor_rect.center() - egui::vec2(0.0, 17.0),
             egui::Align2::CENTER_CENTER,
-            label,
+            (monitor_index + 1).to_string(),
+            egui::FontId::proportional(22.0),
+            ui.visuals().text_color(),
+        );
+        painter.text(
+            monitor_rect.center() + egui::vec2(0.0, 16.0),
+            egui::Align2::CENTER_CENTER,
+            if enabled {
+                format!("{dimensions}\n{refresh_rate}")
+            } else {
+                format!("{dimensions}\nOff")
+            },
             egui::FontId::proportional(12.0),
             ui.visuals().text_color(),
         );
