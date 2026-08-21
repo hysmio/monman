@@ -93,13 +93,16 @@ The project currently targets Rust edition 2024 and uses `windows` 0.62.2 and
 Each GitHub release contains a versioned portable executable and a versioned installer:
 
 ```text
-monman-v1.0.1-windows-x86_64.exe
-monman-v1.0.1-windows-x86_64-setup.exe
+monman-v1.0.2-windows-x86_64.exe
+monman-v1.0.2-windows-x86_64-setup.exe
 ```
 
 The installer is per-user and installs MonMan under
 `%LOCALAPPDATA%\Programs\MonMan`, so it does not require administrator access. It
 also creates a Start menu shortcut and can optionally create a desktop shortcut.
+By default, the installer registers MonMan as a per-user Windows startup app. Login
+launches start directly in the system tray; this can be disabled in Windows' Startup
+Apps settings or by deselecting the startup task during an interactive installation.
 
 MonMan checks GitHub's latest stable release in the background at startup. If its
 semantic version is newer than the running build, an update button appears in the

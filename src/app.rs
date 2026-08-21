@@ -27,6 +27,7 @@ pub struct MonManApp {
     available_update: Option<AvailableUpdate>,
     update_in_progress: bool,
     exit_requested: bool,
+    reveal_window_on_first_frame: bool,
     status: AppStatus,
     dirty: bool,
     last_persist: Instant,
@@ -56,7 +57,7 @@ impl AppStatus {
 }
 
 impl MonManApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup_launch: bool) -> Self {
         configure_ui_style(&cc.egui_ctx);
 
         let (mut config, mut status) = match storage::load() {
@@ -168,6 +169,7 @@ impl MonManApp {
                 None
             }
         };
+        let reveal_window_on_first_frame = startup_launch && tray.is_none();
         let updater = UpdateManager::new(cc.egui_ctx.clone());
         let mut app = Self {
             config,
@@ -182,6 +184,7 @@ impl MonManApp {
             available_update: None,
             update_in_progress: false,
             exit_requested: false,
+            reveal_window_on_first_frame,
             status,
             dirty,
             last_persist: Instant::now(),
@@ -1770,6 +1773,9 @@ fn refresh_rate_label(refresh_hz: f32) -> String {
 
 impl eframe::App for MonManApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.reveal_window_on_first_frame) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
         self.handle_hotkeys();
         self.handle_controllers();
         self.handle_tray(ctx);
