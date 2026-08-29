@@ -1,8 +1,9 @@
 # MonMan
 
-MonMan is a small Windows monitor-layout manager written in Rust with `eframe`/`egui`.
-It uses Windows CCD (`QueryDisplayConfig` / `SetDisplayConfig`) rather than the legacy
-`ChangeDisplaySettingsEx` route.
+MonMan is a small Windows display-and-audio profile manager written in Rust with
+`eframe`/`egui`. It uses Windows CCD (`QueryDisplayConfig` / `SetDisplayConfig`) rather
+than the legacy `ChangeDisplaySettingsEx` route, and Windows Core Audio MMDevice
+endpoints rather than legacy wave device indexes.
 
 The important behavior is that a layout is an **exclusive set of active display paths**.
 When a saved monitor is marked **Off**, MonMan does not move it outside the desktop or
@@ -11,7 +12,8 @@ Windows, so Windows deactivates the display path.
 
 ## Current features
 
-- Capture the current Windows display topology as a named layout.
+- Capture the current Windows display topology and default audio endpoints as a named
+  profile.
 - Create a custom layout seeded from all currently connected monitors.
 - Keep disabled monitors in a saved layout so they can be enabled again later.
 - Drag monitors in an egui preview to edit desktop X/Y coordinates.
@@ -26,6 +28,8 @@ Windows, so Windows deactivates the display path.
   automatically.
 - Duplicate, rename, delete, explicitly save, and automatically save layouts.
 - Assign optional global hotkeys (at least one of `Ctrl` / `Alt` / `Shift` / `Win` + F1-F12 or 0-9).
+- Assign optional default playback and microphone endpoints independently for each
+  profile, using persistent Windows MMDevice endpoint IDs.
 - Learn an optional DualSense controller button or multi-button chord for each
   layout. Standard DualSense and DualSense Edge are supported over USB and Bluetooth.
 - Keep running in the Windows system tray when the GUI is closed, with Open and
@@ -58,10 +62,26 @@ MonMan uses a two-stage CCD apply:
 5. Query the now-active topology again and patch concrete source modes with the saved
    coordinates/resolution plus the saved target refresh rate.
 6. Validate and apply the final mode data and save it to the Windows display database.
+7. Enumerate the now-active Core Audio endpoints and set the selected playback and
+   microphone devices for the console, multimedia, and communications roles.
 
 Clone layouts are represented explicitly. Targets in a clone group share one Windows
 source; independent monitors are allocated separate available sources. This avoids
 mistaking inactive `QDC_ALL_PATHS` routing candidates for an intentional clone setup.
+
+## Audio device behavior
+
+Each profile can independently choose a playback endpoint, a microphone endpoint, both,
+or **Keep current device**. MonMan discovers active devices with the Windows Core Audio
+MMDevice API and stores the persistent endpoint ID together with its last observed
+friendly name. A saved device therefore remains identifiable in the editor while it is
+disconnected.
+
+Audio is applied after the display topology so HDMI and DisplayPort endpoints have a
+chance to become active first. The selected endpoint is assigned to all three Windows
+audio roles (console, multimedia, and communications). If a saved endpoint is still
+unavailable, the apply fails and MonMan attempts to restore the previous display and
+audio settings.
 
 ## Build on Windows
 
@@ -144,10 +164,12 @@ a GitHub pre-release. Rerunning the workflow replaces the assets on an existing 
 4. Drag the monitor rectangles or edit coordinates, source resolution, orientation,
    and refresh rate in the grid.
 5. Use **Make primary** if needed.
-6. Optionally enable and choose a global keyboard hotkey.
-7. Optionally choose **Bind controller chord**, release all controller buttons,
+6. Optionally choose the playback device, microphone, or both. Leave either selector on
+   **Keep current device** when that part of the profile should not be changed.
+7. Optionally enable and choose a global keyboard hotkey.
+8. Optionally choose **Bind controller chord**, release all controller buttons,
    press the desired DualSense button/chord, then release it to save the binding.
-8. Click **Apply**.
+9. Click **Apply**.
 
 Changes are saved to:
 
@@ -159,9 +181,10 @@ Autosave is throttled while controls are being dragged so the file is not rewrit
 every GUI frame. **Save now** is available for an immediate explicit write. The previous
 parseable config is retained as `layouts.json.bak` before the primary file is replaced.
 
-Before applying a layout, MonMan captures the currently active topology in memory. If the
-two-stage CCD apply fails after changing active paths, it attempts to restore that snapshot.
-After a successful apply, **Undo last apply** restores the snapshot manually.
+Before applying a profile, MonMan captures the currently active topology and default
+audio endpoints in memory. If the staged apply fails after changing display paths or
+audio defaults, it attempts to restore that snapshot. After a successful apply,
+**Undo last apply** restores the snapshot manually.
 
 MonMan also stores a separate last-known-working topology in `layouts.json`. At startup it
 waits briefly for display enumeration to settle. Automatic recovery is attempted when there
@@ -204,6 +227,8 @@ woken after MonMan starts.
   Windows can reject CCD changes from unsupported/remote contexts.
 - A layout intentionally fails if a required target is disconnected instead of choosing
   a different monitor with a similar friendly name.
+- A profile intentionally fails if a selected playback or microphone endpoint is
+  unavailable instead of silently substituting another audio device.
 - Startup recovery depends on Windows reporting the broken active target as unavailable;
   displays or adapters that keep reporting availability while physically powered off
   cannot be distinguished reliably through CCD alone.

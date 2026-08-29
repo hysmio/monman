@@ -157,6 +157,8 @@ mod win {
         Ok(MonitorLayout {
             name: name.into(),
             monitors,
+            playback_device: None,
+            microphone_device: None,
             hotkey: None,
             controller_hotkey: None,
         })

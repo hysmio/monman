@@ -1,9 +1,12 @@
+use crate::audio::{self, AudioDeviceInventory};
 use crate::controllers::{
     ControllerDeviceInfo, ControllerEvent, ControllerManager, ControllerSpec,
 };
 use crate::display;
 use crate::hotkeys::{HotkeyEvent, HotkeyManager, HotkeySpec};
-use crate::model::{AppConfig, HotkeyBinding, HotkeyKey, MonitorConfig, MonitorLayout};
+use crate::model::{
+    AppConfig, AudioDeviceConfig, HotkeyBinding, HotkeyKey, MonitorConfig, MonitorLayout,
+};
 use crate::storage;
 use crate::tray::{TrayEvent, TrayManager};
 use crate::updater::{AvailableUpdate, UpdateEvent, UpdateManager};
@@ -19,6 +22,7 @@ pub struct MonManApp {
     selected: Option<usize>,
     hotkeys: HotkeyManager,
     controllers: ControllerManager,
+    audio_devices: AudioDeviceInventory,
     controller_devices: Vec<ControllerDeviceInfo>,
     controller_capture_layout: Option<usize>,
     controller_capture_status: String,
@@ -176,6 +180,7 @@ impl MonManApp {
             selected,
             hotkeys,
             controllers,
+            audio_devices: AudioDeviceInventory::default(),
             controller_devices: Vec::new(),
             controller_capture_layout: None,
             controller_capture_status: String::new(),
@@ -191,6 +196,7 @@ impl MonManApp {
             undo_layout: None,
         };
         app.refresh_bindings();
+        app.refresh_audio_devices(false);
         app
     }
 
@@ -241,6 +247,25 @@ impl MonManApp {
         }
     }
 
+    fn refresh_audio_devices(&mut self, announce: bool) {
+        match audio::enumerate_devices() {
+            Ok(devices) => {
+                let playback_count = devices.playback.len();
+                let microphone_count = devices.microphones.len();
+                self.audio_devices = devices;
+                if announce {
+                    self.status = AppStatus::info(format!(
+                        "Audio devices refreshed: {playback_count} playback, {microphone_count} microphone"
+                    ));
+                }
+            }
+            Err(error) => {
+                self.status =
+                    AppStatus::error(format!("Could not enumerate audio devices: {error:#}"));
+            }
+        }
+    }
+
     fn persist(&mut self, ctx: &egui::Context) {
         if !self.dirty {
             return;
@@ -279,8 +304,11 @@ impl MonManApp {
 
     fn capture_new(&mut self) {
         let name = format!("Layout {}", self.config.layouts.len() + 1);
-        match display::capture_layout(name) {
-            Ok(layout) => self.add_layout(layout, "Captured current Windows display topology"),
+        match capture_profile(name) {
+            Ok(layout) => self.add_layout(
+                layout,
+                "Captured current Windows display topology and audio devices",
+            ),
             Err(err) => {
                 self.status = AppStatus::error(format!("Capture failed: {err:#}"));
             }
@@ -323,14 +351,15 @@ impl MonManApp {
         let old_name = self.config.layouts[index].name.clone();
         let old_hotkey = self.config.layouts[index].hotkey;
         let old_controller_hotkey = self.config.layouts[index].controller_hotkey.clone();
-        match display::capture_layout(old_name) {
+        match capture_profile(old_name) {
             Ok(mut layout) => {
                 layout.hotkey = old_hotkey;
                 layout.controller_hotkey = old_controller_hotkey;
                 self.config.layouts[index] = layout;
                 self.dirty = true;
-                self.status =
-                    AppStatus::info("Replaced this layout with the current desktop topology");
+                self.status = AppStatus::info(
+                    "Replaced this layout with the current display and audio devices",
+                );
             }
             Err(err) => {
                 self.status = AppStatus::error(format!("Capture failed: {err:#}"));
@@ -414,12 +443,12 @@ impl MonManApp {
             return;
         }
 
-        // Applying is staged, so capture a rollback point before changing topology.
-        let previous = match display::capture_layout("Previous topology") {
+        // Applying is staged, so capture a rollback point before changing display or audio.
+        let previous = match capture_profile("Previous profile") {
             Ok(layout) => layout,
             Err(err) => {
                 self.status = AppStatus::error(format!(
-                    "Apply cancelled because the current topology could not be captured for rollback: {err:#}"
+                    "Apply cancelled because the current display and audio settings could not be captured for rollback: {err:#}"
                 ));
                 return;
             }
@@ -427,17 +456,19 @@ impl MonManApp {
 
         let layout = self.config.layouts[index].clone();
         let name = layout.name.clone();
-        match display::apply_layout(&layout) {
+        match apply_profile(&layout) {
             Ok(()) => {
+                self.refresh_audio_devices(false);
                 self.undo_layout = Some(previous);
                 self.remember_working_layout(&layout);
                 self.status = AppStatus::info(format!("Applied '{name}'"));
             }
-            Err(apply_err) => match display::apply_layout(&previous) {
+            Err(apply_err) => match apply_profile(&previous) {
                 Ok(()) => {
+                    self.refresh_audio_devices(false);
                     self.remember_working_layout(&previous);
                     self.status = AppStatus::error(format!(
-                        "Could not apply '{name}': {apply_err:#}. The previous topology was restored."
+                        "Could not apply '{name}': {apply_err:#}. The previous display and audio settings were restored."
                     ));
                 }
                 Err(rollback_err) => {
@@ -454,16 +485,18 @@ impl MonManApp {
             return;
         };
 
-        match display::apply_layout(&previous) {
+        match apply_profile(&previous) {
             Ok(()) => {
+                self.refresh_audio_devices(false);
                 self.remember_working_layout(&previous);
                 self.undo_layout = None;
-                self.status =
-                    AppStatus::info("Restored the topology from before the last successful apply");
+                self.status = AppStatus::info(
+                    "Restored the display and audio settings from before the last successful apply",
+                );
             }
             Err(err) => {
                 self.status =
-                    AppStatus::error(format!("Could not restore the previous topology: {err:#}"));
+                    AppStatus::error(format!("Could not restore the previous profile: {err:#}"));
             }
         }
     }
@@ -711,7 +744,7 @@ impl MonManApp {
                         self.hide_to_tray(ui.ctx());
                     }
                     if sidebar_footer_button(ui, "Undo last apply")
-                        .on_hover_text("Restore the Windows topology captured immediately before the last successful apply")
+                        .on_hover_text("Restore the display and audio settings captured immediately before the last successful apply")
                         .clicked()
                         && self.undo_layout.is_some()
                     {
@@ -847,8 +880,15 @@ impl MonManApp {
                         .iter()
                         .map(ControllerDeviceInfo::label)
                         .collect::<Vec<_>>();
+                    let audio_devices = self.audio_devices.clone();
 
-                    let (layout_action, hotkeys_changed, controller_edit, layout_changed) = {
+                    let (
+                        layout_action,
+                        hotkeys_changed,
+                        controller_edit,
+                        layout_changed,
+                        refresh_audio,
+                    ) = {
                         let layout = &mut self.config.layouts[index];
                         let (name_changed, layout_action) = if show_layout_header {
                             layout_header(ui, layout, index)
@@ -860,6 +900,9 @@ impl MonManApp {
                             ui.add_space(10.0);
                         }
                         let arrangement_changed = monitor_arrangement_editor(ui, layout, index);
+                        ui.add_space(10.0);
+                        let (audio_changed, refresh_audio) =
+                            audio_device_editor(ui, layout, index, &audio_devices);
                         ui.add_space(10.0);
                         let (hotkeys_changed, controller_edit) = shortcut_editors(
                             ui,
@@ -873,6 +916,7 @@ impl MonManApp {
                         ui.add_space(10.0);
                         let monitor_changed = monitor_list_editor(ui, layout, index);
                         let layout_changed = name_changed
+                            || audio_changed
                             || hotkeys_changed
                             || arrangement_changed
                             || monitor_changed
@@ -883,10 +927,14 @@ impl MonManApp {
                             hotkeys_changed,
                             controller_edit,
                             layout_changed,
+                            refresh_audio,
                         )
                     };
 
                     self.dirty |= layout_changed;
+                    if refresh_audio {
+                        self.refresh_audio_devices(true);
+                    }
                     if hotkeys_changed {
                         self.refresh_hotkeys();
                     }
@@ -1097,6 +1145,117 @@ fn layout_header(
         });
     ui.data_mut(|data| data.insert_temp(edit_id, editing_name));
     (name_changed, action)
+}
+
+fn audio_device_editor(
+    ui: &mut egui::Ui,
+    layout: &mut MonitorLayout,
+    index: usize,
+    devices: &AudioDeviceInventory,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut refresh_requested = false;
+    section_frame(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.heading("Audio devices");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                refresh_requested = ui.small_button("Refresh devices").clicked();
+            });
+        });
+        ui.small(
+            "Optionally set the Windows default playback and microphone endpoints for all audio roles when this profile is applied.",
+        );
+        ui.add_space(8.0);
+
+        if ui.available_width() >= DISPLAY_TABLE_BREAKPOINT {
+            ui.columns(2, |columns| {
+                changed |= audio_device_picker(
+                    &mut columns[0],
+                    "Playback",
+                    ("playback_device", index),
+                    &mut layout.playback_device,
+                    &devices.playback,
+                    devices.default_playback_id.as_deref(),
+                );
+                changed |= audio_device_picker(
+                    &mut columns[1],
+                    "Microphone",
+                    ("microphone_device", index),
+                    &mut layout.microphone_device,
+                    &devices.microphones,
+                    devices.default_microphone_id.as_deref(),
+                );
+            });
+        } else {
+            changed |= audio_device_picker(
+                ui,
+                "Playback",
+                ("playback_device", index),
+                &mut layout.playback_device,
+                &devices.playback,
+                devices.default_playback_id.as_deref(),
+            );
+            ui.add_space(8.0);
+            changed |= audio_device_picker(
+                ui,
+                "Microphone",
+                ("microphone_device", index),
+                &mut layout.microphone_device,
+                &devices.microphones,
+                devices.default_microphone_id.as_deref(),
+            );
+        }
+    });
+    (changed, refresh_requested)
+}
+
+fn audio_device_picker(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: impl std::hash::Hash,
+    selected: &mut Option<AudioDeviceConfig>,
+    devices: &[AudioDeviceConfig],
+    default_id: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    let available = selected
+        .as_ref()
+        .is_none_or(|saved| devices.iter().any(|device| device.id == saved.id));
+    let selected_text = match selected.as_ref() {
+        None => "Keep current device".to_string(),
+        Some(device) if available => device.label().to_string(),
+        Some(device) => format!("{} (unavailable)", device.label()),
+    };
+
+    ui.label(egui::RichText::new(label).strong());
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(selected_text)
+        .width(ui.available_width().clamp(180.0, 420.0))
+        .show_ui(ui, |ui| {
+            changed |= ui
+                .selectable_value(selected, None, "Keep current device")
+                .changed();
+            ui.separator();
+            if devices.is_empty() {
+                ui.add_enabled(false, egui::Label::new("No active devices found"));
+            }
+            for device in devices {
+                let option_label = if default_id == Some(device.id.as_str()) {
+                    format!("{} (current default)", device.label())
+                } else {
+                    device.label().to_string()
+                };
+                let response = ui.selectable_value(selected, Some(device.clone()), option_label);
+                changed |= response.changed();
+                response.on_hover_text(&device.id);
+            }
+        });
+    if !available {
+        ui.small(
+            "The saved device is not currently available; applying this profile will fail safely.",
+        );
+    }
+    changed
 }
 
 fn shortcut_editors(
@@ -1880,6 +2039,18 @@ fn accent_color() -> egui::Color32 {
     egui::Color32::from_rgb(8, 103, 216)
 }
 
+fn capture_profile(name: impl Into<String>) -> anyhow::Result<MonitorLayout> {
+    let mut layout = display::capture_layout(name)?;
+    audio::capture_current_devices(&mut layout)?;
+    Ok(layout)
+}
+
+fn apply_profile(layout: &MonitorLayout) -> anyhow::Result<()> {
+    display::apply_layout(layout)?;
+    audio::apply_layout(layout)?;
+    Ok(())
+}
+
 fn working_snapshot(fallback: &MonitorLayout) -> MonitorLayout {
     display::capture_layout("Last known working topology")
         .map(sanitized_working_snapshot)
@@ -1904,6 +2075,8 @@ fn refresh_monitor(existing: &mut MonitorConfig, current: MonitorConfig) {
 
 fn sanitized_working_snapshot(mut layout: MonitorLayout) -> MonitorLayout {
     layout.name = "Last known working topology".into();
+    layout.playback_device = None;
+    layout.microphone_device = None;
     layout.hotkey = None;
     layout.controller_hotkey = None;
     layout
@@ -2373,6 +2546,8 @@ mod tests {
         let layout = MonitorLayout {
             name: "snap test".into(),
             monitors: vec![target, moving],
+            playback_device: None,
+            microphone_device: None,
             hotkey: None,
             controller_hotkey: None,
         };

@@ -14,10 +14,35 @@ pub struct MonitorLayout {
     pub name: String,
     #[serde(default)]
     pub monitors: Vec<MonitorConfig>,
+    /// Default Windows render endpoint to select when this profile is applied.
+    #[serde(default)]
+    pub playback_device: Option<AudioDeviceConfig>,
+    /// Default Windows capture endpoint to select when this profile is applied.
+    #[serde(default)]
+    pub microphone_device: Option<AudioDeviceConfig>,
     #[serde(default)]
     pub hotkey: Option<HotkeyBinding>,
     #[serde(default)]
     pub controller_hotkey: Option<ControllerBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioDeviceConfig {
+    /// Persistent MMDevice endpoint identifier returned by IMMDevice::GetId.
+    pub id: String,
+    /// Last observed friendly name, retained so disconnected devices remain identifiable.
+    #[serde(default)]
+    pub name: String,
+}
+
+impl AudioDeviceConfig {
+    pub fn label(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +330,17 @@ mod tests {
             serde_json::from_str(r#"{"layouts":[]}"#).expect("legacy config should load");
 
         assert!(config.last_known_working.is_none());
+    }
+
+    #[test]
+    fn older_layouts_leave_audio_devices_unchanged() {
+        let layout: MonitorLayout = serde_json::from_str(
+            r#"{"name":"Legacy","monitors":[],"hotkey":null,"controller_hotkey":null}"#,
+        )
+        .expect("legacy layout should load");
+
+        assert!(layout.playback_device.is_none());
+        assert!(layout.microphone_device.is_none());
     }
 
     #[test]

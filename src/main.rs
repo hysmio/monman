@@ -4,6 +4,7 @@
 )]
 
 mod app;
+mod audio;
 mod controllers;
 mod display;
 mod hotkeys;
