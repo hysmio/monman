@@ -27,7 +27,7 @@ pub struct MonManApp {
     available_update: Option<AvailableUpdate>,
     update_in_progress: bool,
     exit_requested: bool,
-    reveal_window_on_first_frame: bool,
+    initial_window_visibility: Option<bool>,
     status: AppStatus,
     dirty: bool,
     last_persist: Instant,
@@ -169,7 +169,7 @@ impl MonManApp {
                 None
             }
         };
-        let reveal_window_on_first_frame = startup_launch && tray.is_none();
+        let initial_window_visibility = startup_window_visibility(startup_launch, tray.is_some());
         let updater = UpdateManager::new(cc.egui_ctx.clone());
         let mut app = Self {
             config,
@@ -184,7 +184,7 @@ impl MonManApp {
             available_update: None,
             update_in_progress: false,
             exit_requested: false,
-            reveal_window_on_first_frame,
+            initial_window_visibility,
             status,
             dirty,
             last_persist: Instant::now(),
@@ -1771,10 +1771,17 @@ fn refresh_rate_label(refresh_hz: f32) -> String {
     }
 }
 
+fn startup_window_visibility(startup_launch: bool, tray_available: bool) -> Option<bool> {
+    startup_launch.then_some(!tray_available)
+}
+
 impl eframe::App for MonManApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if std::mem::take(&mut self.reveal_window_on_first_frame) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        if let Some(visible) = self.initial_window_visibility.take() {
+            // eframe shows the root window after its first rendered frame, even when the
+            // native viewport was created hidden. Reassert the startup visibility after
+            // that frame so a healthy tray launch remains tray-only.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
         }
         self.handle_hotkeys();
         self.handle_controllers();
@@ -2311,6 +2318,13 @@ fn display_size(monitor: &crate::model::MonitorConfig) -> (u32, u32) {
 mod tests {
     use super::*;
     use crate::model::MonitorIdentity;
+
+    #[test]
+    fn startup_visibility_tracks_tray_availability() {
+        assert_eq!(startup_window_visibility(true, true), Some(false));
+        assert_eq!(startup_window_visibility(true, false), Some(true));
+        assert_eq!(startup_window_visibility(false, true), None);
+    }
 
     fn monitor(
         name: &str,
